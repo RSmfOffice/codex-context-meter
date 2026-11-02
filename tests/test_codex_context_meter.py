@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from codex_context_meter.session_stats import (
@@ -10,7 +11,15 @@ from codex_context_meter.session_stats import (
     SessionStatsTracker,
     estimate_model_visible_item,
 )
-from codex_context_meter.widget import HEIGHT, WIDTH, clamp_overlay_position
+from codex_context_meter.widget import (
+    HEIGHT,
+    PAYLOAD_CRITICAL_BYTES,
+    PAYLOAD_WARNING_BYTES,
+    WIDTH,
+    clamp_overlay_position,
+    payload_risk,
+    write_handoff_report,
+)
 from codex_context_meter.window_follower import translated_position
 
 
@@ -188,6 +197,228 @@ class SessionStatsTrackerTests(unittest.TestCase):
                 snapshot.projected_tokens,
                 1_000 + snapshot.surface_delta_tokens,
             )
+
+    def test_detects_image_payload_and_413(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            session_dir = home / "sessions" / "2026" / "11" / "02"
+            session_dir.mkdir(parents=True)
+            session_path = session_dir / f"rollout-2026-11-02T20-00-00-{THREAD_ID}.jsonl"
+            image_url = "data:image/png;base64," + ("A" * 10_000)
+            rows = [
+                {
+                    "type": "turn_context",
+                    "payload": {"model": "deepseek-flash"},
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "output": [
+                            {
+                                "type": "input_image",
+                                "image_url": image_url,
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 5_000,
+                                "cached_input_tokens": 4_000,
+                            },
+                            "last_token_usage": {"input_tokens": 5_000},
+                            "model_context_window": 100_000,
+                        },
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "error": {
+                            "message": "unexpected status 413 Request Entity Too Large"
+                        },
+                    },
+                },
+            ]
+            session_path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            tracker = SessionStatsTracker(home)
+            snapshot = tracker.snapshot(THREAD_ID)
+            assert snapshot is not None
+            self.assertEqual(snapshot.image_count, 1)
+            self.assertEqual(snapshot.image_payload_bytes, len(image_url.encode("utf-8")))
+            self.assertGreater(snapshot.request_payload_bytes, snapshot.image_payload_bytes)
+            self.assertTrue(snapshot.request_too_large)
+            self.assertEqual(snapshot.request_error, "413")
+
+    def test_payload_stats_update_incrementally(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            session_dir = home / "sessions" / "2026" / "11" / "02"
+            session_dir.mkdir(parents=True)
+            session_path = session_dir / f"rollout-2026-11-02T20-00-00-{THREAD_ID}.jsonl"
+            base_rows = [
+                {"type": "turn_context", "payload": {"model": "deepseek-flash"}},
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "output": [
+                            {
+                                "type": "input_image",
+                                "image_url": "data:image/png;base64,AAAA",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {"input_tokens": 100},
+                            "last_token_usage": {"input_tokens": 100},
+                            "model_context_window": 10_000,
+                        },
+                    },
+                },
+            ]
+            session_path.write_text(
+                "\n".join(json.dumps(row) for row in base_rows) + "\n",
+                encoding="utf-8",
+            )
+            tracker = SessionStatsTracker(home)
+            first = tracker.snapshot(THREAD_ID)
+            assert first is not None
+            self.assertEqual(first.image_count, 1)
+
+            extra_rows = [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "output": [
+                            {
+                                "type": "input_image",
+                                "image_url": "data:image/png;base64,BBBBBBBB",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "error": {"message": "413 Payload Too Large"},
+                    },
+                },
+            ]
+            with session_path.open("a", encoding="utf-8") as stream:
+                for row in extra_rows:
+                    stream.write(json.dumps(row) + "\n")
+
+            second = tracker.snapshot(THREAD_ID)
+            assert second is not None
+            self.assertEqual(second.image_count, 2)
+            self.assertGreater(second.image_payload_bytes, first.image_payload_bytes)
+            self.assertGreater(second.request_payload_bytes, first.request_payload_bytes)
+            self.assertTrue(second.request_too_large)
+            self.assertGreater(second.min_failure_payload_bytes, 0)
+
+            with session_path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {"type": "task_complete", "error": None},
+                        }
+                    )
+                    + "\n"
+                )
+            recovered = tracker.snapshot(THREAD_ID)
+            assert recovered is not None
+            self.assertFalse(recovered.request_too_large)
+            self.assertEqual(recovered.min_failure_payload_bytes, 0)
+
+    def test_payload_budget_and_handoff_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            session_dir = home / "sessions" / "2026" / "11" / "02"
+            session_dir.mkdir(parents=True)
+            session_path = session_dir / f"rollout-2026-11-02T20-00-00-{THREAD_ID}.jsonl"
+            rows = [
+                {"type": "turn_context", "payload": {"model": "deepseek-flash"}},
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {"input_tokens": 1_000},
+                            "last_token_usage": {"input_tokens": 1_000},
+                            "model_context_window": 10_000,
+                        },
+                    },
+                },
+            ]
+            session_path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            snapshot = SessionStatsTracker(home).snapshot(THREAD_ID)
+            assert snapshot is not None
+            normal = replace(
+                snapshot,
+                request_payload_bytes=10_000,
+                request_too_large=False,
+            )
+            warning = replace(
+                normal,
+                request_payload_bytes=PAYLOAD_WARNING_BYTES,
+            )
+            critical = replace(
+                normal,
+                request_payload_bytes=PAYLOAD_CRITICAL_BYTES,
+            )
+            known_safe = replace(
+                normal,
+                request_payload_bytes=50_000_000,
+                max_success_payload_bytes=62_000_000,
+            )
+            beyond_known = replace(
+                known_safe,
+                request_payload_bytes=64_000_000,
+            )
+            near_failure = replace(
+                normal,
+                request_payload_bytes=54_000_000,
+                max_success_payload_bytes=50_000_000,
+                min_failure_payload_bytes=56_000_000,
+            )
+            self.assertEqual(payload_risk(normal), "normal")
+            self.assertEqual(payload_risk(warning), "warning")
+            self.assertEqual(payload_risk(critical), "critical")
+            self.assertEqual(payload_risk(known_safe), "normal")
+            self.assertEqual(payload_risk(beyond_known), "warning")
+            self.assertEqual(payload_risk(near_failure), "critical")
+
+            report = write_handoff_report(
+                critical,
+                THREAD_ID,
+                "测试会话",
+                directory=home / "handoffs",
+            )
+            text = report.read_text(encoding="utf-8")
+            self.assertIn("Codex 交接报告", text)
+            self.assertIn(THREAD_ID, text)
+            self.assertIn("载荷状态：`critical`", text)
 
 
 class OverlayGeometryTests(unittest.TestCase):

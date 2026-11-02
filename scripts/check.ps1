@@ -73,7 +73,7 @@ try {
     @{
         ok = $true
         version = $version
-        pythonTests = 7
+        pythonTests = 10
     } | ConvertTo-Json
 }
 finally {

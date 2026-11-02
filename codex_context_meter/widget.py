@@ -13,6 +13,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 import tkinter as tk
+from tkinter import messagebox
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from .active_thread import ActiveThreadMonitor
@@ -177,6 +178,8 @@ STATS_INTERVAL_SECONDS = 0.18
 UI_UPDATE_MS = 100
 STATE_WRITE_INTERVAL_SECONDS = 2.0
 CARD_RADIUS = 14
+PAYLOAD_WARNING_BYTES = 32 * 1024 * 1024
+PAYLOAD_CRITICAL_BYTES = 42 * 1024 * 1024
 
 
 def _app_dir() -> Path:
@@ -207,6 +210,8 @@ def load_config() -> dict:
         "manual_thread_id": None,
         "manual_pin": False,
         "alpha": 0.94,
+        "payload_warning_bytes": PAYLOAD_WARNING_BYTES,
+        "payload_critical_bytes": PAYLOAD_CRITICAL_BYTES,
     }
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -232,6 +237,8 @@ def write_state(
     active_title: str = "",
     active_error: str = "",
     follow_state: dict | None = None,
+    payload_warning_bytes: int = PAYLOAD_WARNING_BYTES,
+    payload_critical_bytes: int = PAYLOAD_CRITICAL_BYTES,
 ) -> None:
     payload = {
         "ok": True,
@@ -247,6 +254,20 @@ def write_state(
         "cacheHitRate": round(snapshot.cache_hit_rate * 100, 4) if snapshot and snapshot.cache_hit_rate is not None else None,
         "exact": snapshot.exact if snapshot else None,
         "stale": snapshot.stale if snapshot else None,
+        "requestPayloadBytes": snapshot.request_payload_bytes if snapshot else None,
+        "imageCount": snapshot.image_count if snapshot else None,
+        "imagePayloadBytes": snapshot.image_payload_bytes if snapshot else None,
+        "maxSuccessfulRequestBytes": snapshot.max_success_payload_bytes if snapshot else None,
+        "minFailedRequestBytes": snapshot.min_failure_payload_bytes if snapshot else None,
+        "requestTooLarge": snapshot.request_too_large if snapshot else None,
+        "requestError": snapshot.request_error if snapshot else "",
+        "payloadWarningBytes": payload_warning_bytes,
+        "payloadCriticalBytes": payload_critical_bytes,
+        "payloadRisk": payload_risk(
+            snapshot,
+            payload_warning_bytes,
+            payload_critical_bytes,
+        ),
         "nativeFollow": follow_state,
         "updatedAt": time.time(),
     }
@@ -257,6 +278,126 @@ def write_state(
         os.replace(temporary_name, STATE_PATH)
     except OSError as error:
         log(f"write state failed: {error}")
+
+
+def payload_risk(
+    snapshot: SessionSnapshot | None,
+    warning_bytes: int = PAYLOAD_WARNING_BYTES,
+    critical_bytes: int = PAYLOAD_CRITICAL_BYTES,
+) -> str:
+    if snapshot is None:
+        return "unknown"
+    current = snapshot.request_payload_bytes
+    if snapshot.request_too_large or (
+        snapshot.min_failure_payload_bytes > 0
+        and current >= snapshot.min_failure_payload_bytes
+    ):
+        return "critical"
+    if snapshot.min_failure_payload_bytes > 0:
+        margin = max(
+            2 * 1024 * 1024,
+            snapshot.min_failure_payload_bytes // 20,
+        )
+        if current >= snapshot.min_failure_payload_bytes - margin:
+            return "critical"
+        if current >= snapshot.min_failure_payload_bytes * 0.9:
+            return "warning"
+        return "normal"
+    if snapshot.max_success_payload_bytes > 0:
+        if current >= max(
+            critical_bytes,
+            snapshot.max_success_payload_bytes * 1.15,
+        ):
+            return "critical"
+        if current >= max(
+            warning_bytes,
+            snapshot.max_success_payload_bytes * 1.02,
+        ):
+            return "warning"
+        return "normal"
+    if current >= critical_bytes:
+        return "critical"
+    if current >= warning_bytes:
+        return "warning"
+    return "normal"
+
+
+def write_handoff_report(
+    snapshot: SessionSnapshot | None,
+    thread_id: str | None,
+    active_title: str,
+    warning_bytes: int = PAYLOAD_WARNING_BYTES,
+    critical_bytes: int = PAYLOAD_CRITICAL_BYTES,
+    directory: Path | None = None,
+) -> Path:
+    target_dir = directory or (APP_DIR / "handoffs")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    short_id = (thread_id or "unknown")[:8]
+    path = target_dir / f"handoff-{stamp}-{short_id}.md"
+    risk = payload_risk(snapshot, warning_bytes, critical_bytes)
+    title = (snapshot.title if snapshot else "") or active_title or "未识别会话"
+    lines = [
+        "# Codex 交接报告",
+        "",
+        f"- 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- 会话：{title}",
+        f"- thread_id：`{thread_id or 'unknown'}`",
+        f"- 载荷状态：`{risk}`",
+        "",
+        "## 当前指标",
+        "",
+    ]
+    if snapshot:
+        lines += [
+            f"- 上下文：{snapshot.projected_tokens:,} / {snapshot.context_window:,} token（{snapshot.percent:.2f}%）",
+            f"- 剩余：{snapshot.remaining_tokens:,} token",
+            f"- 缓存命中率：{cache_rate_text(snapshot)}",
+            f"- 估算请求体：{compact_payload_bytes(snapshot.request_payload_bytes)}",
+            f"- 安全预警/停止预算：{compact_payload_bytes(warning_bytes)} / {compact_payload_bytes(critical_bytes)}",
+            f"- 图片：{snapshot.image_count} 张，载荷 {compact_payload_bytes(snapshot.image_payload_bytes)}",
+            "- 本会话已验证请求体："
+            + (
+                compact_payload_bytes(snapshot.max_success_payload_bytes)
+                if snapshot.max_success_payload_bytes
+                else "尚未观测"
+            ),
+            "- 本会话已知失败请求体："
+            + (
+                compact_payload_bytes(snapshot.min_failure_payload_bytes)
+                if snapshot.min_failure_payload_bytes
+                else "尚未观测"
+            ),
+            f"- 最近请求超限：{'是' if snapshot.request_too_large else '否'}",
+        ]
+        if snapshot.request_error:
+            lines.append(f"- provider 错误：`{snapshot.request_error}`")
+    else:
+        lines.append("- 暂无可用的上下文快照。")
+    lines += [
+        "",
+        "## 工作摘要",
+        "",
+        "<!-- 补充正在完成的目标、已完成内容和关键决策。 -->",
+        "",
+        "## 待办与下一步",
+        "",
+        "<!-- 补充剩余步骤。建议在新会话中只附必要文件与少量压缩图片。 -->",
+        "",
+        "## 关键文件与产物",
+        "",
+        "<!-- 列出新会话需要使用的文件路径、产物和验证结果。 -->",
+        "",
+        "## 恢复建议",
+        "",
+        "- 不要在 413 后继续向同一图片密集会话追加附件。",
+        "- 新建会话，只携带必要文件和压缩后的关键图片。",
+        "- 图片核对尽量先形成文字结论，再进入后续生成任务。",
+    ]
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return path
 
 
 def process_name(pid: int) -> str:
@@ -516,6 +657,13 @@ def compact_tokens(value: int) -> str:
     return f"{scaled:.1f}M"
 
 
+def compact_payload_bytes(value: int) -> str:
+    value = max(0, int(value))
+    if value < 1_000_000:
+        return f"{value / 1000:.0f}KB"
+    return f"{value / 1_000_000:.1f}MB"
+
+
 def cache_rate_text(snapshot: SessionSnapshot | None) -> str:
     if not snapshot or snapshot.cache_hit_rate is None:
         return "--"
@@ -544,6 +692,13 @@ def snapshot_signature(snapshot: SessionSnapshot | None) -> tuple | None:
         snapshot.stale,
         snapshot.total_input_tokens,
         snapshot.total_cached_input_tokens,
+        snapshot.request_payload_bytes,
+        snapshot.image_count,
+        snapshot.image_payload_bytes,
+        snapshot.max_success_payload_bytes,
+        snapshot.min_failure_payload_bytes,
+        snapshot.request_too_large,
+        snapshot.request_error,
     )
 
 
@@ -576,7 +731,11 @@ def enable_dpi_awareness() -> None:
         pass
 
 
-def render_meter_image(snapshot: SessionSnapshot | None) -> Image.Image:
+def render_meter_image(
+    snapshot: SessionSnapshot | None,
+    payload_warning_bytes: int = PAYLOAD_WARNING_BYTES,
+    payload_critical_bytes: int = PAYLOAD_CRITICAL_BYTES,
+) -> Image.Image:
     image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), BG)
     draw = ImageDraw.Draw(image)
     box = (1 * SCALE, 1 * SCALE, (WIDTH - 1) * SCALE, (HEIGHT - 1) * SCALE)
@@ -590,6 +749,11 @@ def render_meter_image(snapshot: SessionSnapshot | None) -> Image.Image:
 
     percent = snapshot.percent if snapshot else 0.0
     color = ring_color(percent) if snapshot else MUTED
+    request_risk = payload_risk(
+        snapshot,
+        payload_warning_bytes,
+        payload_critical_bytes,
+    )
     center = (31 * SCALE, 41 * SCALE)
     radius = 21 * SCALE
     ring_box = (
@@ -616,7 +780,13 @@ def render_meter_image(snapshot: SessionSnapshot | None) -> Image.Image:
     title = trim_text(draw, title, max_title_width, FONT_TITLE)
     draw.ellipse(
         (right_x, 11 * SCALE, right_x + 5 * SCALE, 16 * SCALE),
-        fill=color,
+        fill=(
+            RED
+            if request_risk == "critical"
+            else AMBER
+            if request_risk == "warning"
+            else color
+        ),
     )
     draw.text(
         (right_x + 9 * SCALE, 8 * SCALE),
@@ -634,7 +804,42 @@ def render_meter_image(snapshot: SessionSnapshot | None) -> Image.Image:
         draw.text((right_x, 48 * SCALE), remaining, fill=MUTED, font=FONT_META)
         draw.text((right_x + 67 * SCALE, 48 * SCALE), "·", fill=TRACK, font=FONT_META)
         draw.text((right_x + 77 * SCALE, 48 * SCALE), f"缓存 {rate}", fill=GREEN, font=FONT_META)
-        if snapshot.stale:
+        if snapshot.request_too_large:
+            warning = f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)} · 413 超限"
+            draw.text((right_x, 63 * SCALE), warning, fill=RED, font=FONT_META)
+        elif request_risk == "critical":
+            warning = (
+                f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)}"
+                " · 接近失败线"
+                if snapshot.min_failure_payload_bytes
+                else f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)}"
+                " · 超保守预算"
+            )
+            draw.text((right_x, 63 * SCALE), warning, fill=RED, font=FONT_META)
+        elif request_risk == "warning":
+            if snapshot.min_failure_payload_bytes:
+                warning = (
+                    f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)}"
+                    " · 本会话高风险"
+                )
+            elif snapshot.max_success_payload_bytes:
+                warning = (
+                    f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)}"
+                    " · 超已验证值"
+                )
+            else:
+                warning = (
+                    f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)}"
+                    " · 接近保守预算"
+                )
+            draw.text((right_x, 63 * SCALE), warning, fill=AMBER, font=FONT_META)
+        elif snapshot.image_payload_bytes >= 8_000_000:
+            warning = (
+                f"图片 {snapshot.image_count} 张 · "
+                f"{compact_payload_bytes(snapshot.image_payload_bytes)}"
+            )
+            draw.text((right_x, 63 * SCALE), warning, fill=AMBER, font=FONT_META)
+        elif snapshot.stale:
             draw.text((right_x, 63 * SCALE), "等待下一次 usage 校准", fill=AMBER, font=FONT_META)
     else:
         draw.text((right_x, 28 * SCALE), "暂无会话用量", fill=MUTED, font=FONT_VALUE)
@@ -942,6 +1147,31 @@ class ContextMeterWidget:
                 label=f"当前会话缓存命中 {cache_rate_text(self.snapshot)}",
                 state="disabled",
             )
+            if self.snapshot.image_count:
+                request_text = (
+                    f"图片 {self.snapshot.image_count} 张 · "
+                    f"{compact_payload_bytes(self.snapshot.image_payload_bytes)}"
+                )
+                menu.add_command(label=request_text, state="disabled")
+            if self.snapshot.request_too_large:
+                menu.add_command(label="上次请求：413 请求体超限", state="disabled")
+            if self.snapshot.max_success_payload_bytes:
+                menu.add_command(
+                    label=(
+                        "本会话已验证请求体 "
+                        f"{compact_payload_bytes(self.snapshot.max_success_payload_bytes)}"
+                    ),
+                    state="disabled",
+                )
+            if self.snapshot.min_failure_payload_bytes:
+                menu.add_command(
+                    label=(
+                        "本会话失败请求体 "
+                        f"{compact_payload_bytes(self.snapshot.min_failure_payload_bytes)}"
+                    ),
+                    state="disabled",
+                )
+            menu.add_command(label="生成交接报告", command=self._write_handoff)
             menu.add_separator()
         menu.add_command(label="自动跟随当前选中会话", command=self._reset_auto)
         sessions = tk.Menu(menu, tearoff=False)
@@ -968,6 +1198,27 @@ class ContextMeterWidget:
         save_config(self.config)
         self.root.destroy()
 
+    def _write_handoff(self) -> None:
+        warning_bytes = int(
+            self.config.get("payload_warning_bytes", PAYLOAD_WARNING_BYTES)
+        )
+        critical_bytes = int(
+            self.config.get("payload_critical_bytes", PAYLOAD_CRITICAL_BYTES)
+        )
+        try:
+            path = write_handoff_report(
+                self.snapshot,
+                self.snapshot_thread_id,
+                self.active_thread.title,
+                warning_bytes,
+                critical_bytes,
+            )
+            log(f"handoff written: {path}")
+            messagebox.showinfo("交接报告", f"已保存到：\n{path}")
+        except OSError as error:
+            log(f"write handoff failed: {error}")
+            messagebox.showerror("交接报告", f"保存失败：\n{error}")
+
     def _cycle_session(self) -> None:
         with self.stats_lock:
             recent = list(self.worker_recent_threads)
@@ -985,7 +1236,11 @@ class ContextMeterWidget:
         self._update()
 
     def _render(self, snapshot: SessionSnapshot | None) -> None:
-        image = render_meter_image(snapshot)
+        image = render_meter_image(
+            snapshot,
+            int(self.config.get("payload_warning_bytes", PAYLOAD_WARNING_BYTES)),
+            int(self.config.get("payload_critical_bytes", PAYLOAD_CRITICAL_BYTES)),
+        )
         self.photo = ImageTk.PhotoImage(image)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
@@ -1133,6 +1388,18 @@ class ContextMeterWidget:
                         }
                         if self.host_follower
                         else None
+                    ),
+                    int(
+                        self.config.get(
+                            "payload_warning_bytes",
+                            PAYLOAD_WARNING_BYTES,
+                        )
+                    ),
+                    int(
+                        self.config.get(
+                            "payload_critical_bytes",
+                            PAYLOAD_CRITICAL_BYTES,
+                        )
                     ),
                 )
                 self.last_state_key = state_key

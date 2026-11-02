@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -16,6 +16,7 @@ INITIAL_TAIL_BYTES = 8 * 1024 * 1024
 MAX_TAIL_BYTES = 64 * 1024 * 1024
 MAX_SESSION_FILES = 128
 CATALOG_CACHE_SECONDS = 1.0
+IMAGE_ITEM_TYPES = {"input_image", "image", "image_url"}
 
 
 def _int(value: Any) -> int:
@@ -149,6 +150,13 @@ class SessionSnapshot:
     cache_hit_rate: float | None
     updated_at: float | None
     file_path: str
+    request_payload_bytes: int = 0
+    image_count: int = 0
+    image_payload_bytes: int = 0
+    max_success_payload_bytes: int = 0
+    min_failure_payload_bytes: int = 0
+    request_too_large: bool = False
+    request_error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -161,6 +169,20 @@ class _FileResult:
     size: int
 
 
+@dataclass
+class _PayloadState:
+    offset: int = 0
+    modified_ns: int = 0
+    pending: bytes = b""
+    request_payload_bytes: int = 0
+    image_count: int = 0
+    image_payload_bytes: int = 0
+    max_success_payload_bytes: int = 0
+    min_failure_payload_bytes: int = 0
+    request_too_large: bool = False
+    request_error: str = ""
+
+
 class SessionStatsTracker:
     """Read one Codex session and project its next prompt from the last usage anchor."""
 
@@ -171,6 +193,7 @@ class SessionStatsTracker:
         self.index_path = self.codex_home / "session_index.jsonl"
         self.global_state_path = self.codex_home / ".codex-global-state.json"
         self._cache: dict[str, _FileResult] = {}
+        self._payload_cache: dict[str, _PayloadState] = {}
         self._index_cache: tuple[int, dict[str, str], dict[str, float]] | None = None
         self._activity_cache: tuple[int, dict[str, float]] | None = None
         self._session_files_cache: tuple[float, list[Path]] | None = None
@@ -370,8 +393,135 @@ class SessionStatsTracker:
         if cached and cached.modified_ns == stat.st_mtime_ns and cached.size == stat.st_size:
             return cached.snapshot
         snapshot = self._inspect(path, thread_id, stat.st_mtime)
+        if snapshot is not None:
+            payload = self._payload_stats(path, stat)
+            snapshot = replace(
+                snapshot,
+                request_payload_bytes=payload.request_payload_bytes,
+                image_count=payload.image_count,
+                image_payload_bytes=payload.image_payload_bytes,
+                max_success_payload_bytes=payload.max_success_payload_bytes,
+                min_failure_payload_bytes=payload.min_failure_payload_bytes,
+                request_too_large=payload.request_too_large,
+                request_error=payload.request_error,
+            )
         self._cache[str(path)] = _FileResult(snapshot, stat.st_mtime_ns, stat.st_size)
         return snapshot
+
+    def _payload_stats(self, path: Path, stat: os.stat_result) -> _PayloadState:
+        key = str(path)
+        state = self._payload_cache.get(key)
+        if (
+            state is not None
+            and state.offset == stat.st_size
+            and state.modified_ns == stat.st_mtime_ns
+        ):
+            return state
+        if (
+            state is None
+            or stat.st_size < state.offset
+            or (
+                stat.st_size == state.offset
+                and stat.st_mtime_ns != state.modified_ns
+            )
+        ):
+            state = _PayloadState()
+            self._payload_cache[key] = state
+
+        try:
+            with path.open("rb") as stream:
+                stream.seek(state.offset)
+                chunk = stream.read()
+        except OSError:
+            return state
+        state.offset += len(chunk)
+        state.modified_ns = stat.st_mtime_ns
+        buffered = state.pending + chunk
+        lines = buffered.split(b"\n")
+        state.pending = lines.pop()
+        for raw in lines:
+            self._consume_payload_line(raw, state)
+        return state
+
+    @staticmethod
+    def _image_payload(url: Any) -> int:
+        if isinstance(url, dict):
+            url = url.get("url")
+        if not isinstance(url, str):
+            return 0
+        return len(url.encode("utf-8"))
+
+    @classmethod
+    def _consume_payload_value(cls, value: Any, state: _PayloadState) -> None:
+        if isinstance(value, dict):
+            if value.get("type") in IMAGE_ITEM_TYPES:
+                state.image_count += 1
+                state.image_payload_bytes += cls._image_payload(
+                    value.get("image_url") or value.get("url")
+                )
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    cls._consume_payload_value(nested, state)
+        elif isinstance(value, list):
+            for nested in value:
+                cls._consume_payload_value(nested, state)
+
+    @classmethod
+    def _consume_payload_line(cls, raw: bytes, state: _PayloadState) -> None:
+        if (
+            b'"response_item"' not in raw
+            and b'"token_usage_record"' not in raw
+            and b'"task_complete"' not in raw
+        ):
+            return
+        try:
+            item = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(item, dict):
+            return
+        kind = item.get("type")
+        payload = item.get("payload")
+        if kind == "response_item":
+            state.request_payload_bytes += len(raw) + 1
+            cls._consume_payload_value(payload, state)
+            return
+        if kind == "token_usage_record":
+            state.max_success_payload_bytes = max(
+                state.max_success_payload_bytes,
+                state.request_payload_bytes,
+            )
+            return
+        if kind != "event_msg" or not isinstance(payload, dict):
+            return
+        if payload.get("type") != "task_complete":
+            return
+        error = payload.get("error")
+        if not error:
+            state.request_too_large = False
+            state.request_error = ""
+            state.max_success_payload_bytes = max(
+                state.max_success_payload_bytes,
+                state.request_payload_bytes,
+            )
+            if (
+                state.min_failure_payload_bytes > 0
+                and state.request_payload_bytes >= state.min_failure_payload_bytes
+            ):
+                state.min_failure_payload_bytes = 0
+            return
+        message = str(error.get("message") if isinstance(error, dict) else error)
+        if "413" in message or "too large" in message.casefold():
+            state.request_too_large = True
+            state.request_error = "413"
+            state.min_failure_payload_bytes = (
+                state.request_payload_bytes
+                if state.min_failure_payload_bytes <= 0
+                else min(
+                    state.min_failure_payload_bytes,
+                    state.request_payload_bytes,
+                )
+            )
 
     def _inspect(self, path: Path, thread_id: str, modified: float) -> SessionSnapshot | None:
         lines: list[str] = []

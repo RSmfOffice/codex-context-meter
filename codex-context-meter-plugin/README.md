@@ -39,6 +39,7 @@ Codex，让 MCP 工具和插件界面进入当前进程。
 - `context_meter_status`：读取当前 `thread_id`、上下文占用、余量、缓存命中率及新鲜度。
 - `context_meter_show`：清除本次会话暂停标记并恢复组件。
 - `context_meter_stop`：暂停组件，直到当前 Codex 进程退出。
+- 悬浮窗右键菜单：可生成本地 Markdown 交接报告，包含上下文、图片载荷、413 风险和待办模板。
 
 ## 卸载
 

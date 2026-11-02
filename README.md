@@ -11,6 +11,7 @@
 
 - 显示当前上下文占用圆环、已用 token 和剩余 token。
 - 显示当前会话累计缓存命中率。
+- 检测图片 data URI 载荷；provider 返回 413 时单独显示请求体超限，不误报为上下文接近上限。
 - 自动跟随 Codex 当前选中的聊天，不跨会话累加。
 - 悬浮窗归属 Codex，不全局置顶，也不会遮挡其他应用。
 - 支持拖动、位置记忆、自动跟随和右键手动锁定会话。
@@ -84,6 +85,16 @@ total_token_usage.cached_input_tokens
 
 只使用当前单个 `thread_id` 的累计值。
 
+### 为什么 token 未满仍可能 413？
+
+上下文 token 窗口与 HTTP 请求体大小是两个独立限制。图片较多时，即使 token
+占用较低，base64 图片也可能让请求体超过 provider 的传输上限。插件会显示图片
+数量、估算请求体大小，并在检测到 `413 Request Entity Too Large` 时给出红色警告。
+
+不同会话的网关或路由限制可能不同。插件优先使用本会话已经成功的最大请求体和
+已经失败的最小请求体判断风险；只有缺少本会话证据时，才使用可配置的
+32MiB/42MiB 保守预警线。右键菜单可随时生成 Markdown 交接报告。
+
 ## 架构
 
 - `codex_context_meter/`：统计、会话识别、Tk 界面和跟随逻辑。
@@ -123,6 +134,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.
 - Codex 大版本升级可能改变 UI Automation 树，需要回归会话标题识别。
 - 同名会话只能按最近更新时间选择；可使用右键菜单手动锁定。
 - 锚点之后的增量是估算值，CJK、代码和复杂 JSON 可能有偏差。
+- provider 的 413 请求体上限不会改变上下文 token 百分比；需要根据图片数量和请求体警告控制附件规模。
 - compaction 后可能短暂显示“等待下一次 usage 校准”。
 - 当前仅支持 Windows。
 
