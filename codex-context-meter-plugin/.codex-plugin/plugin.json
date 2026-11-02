@@ -1,0 +1,33 @@
+{
+  "name": "codex-context-meter",
+  "version": "0.1.0",
+  "description": "随 Codex 启动的单会话上下文圆环、剩余 token 与缓存命中率悬浮组件。",
+  "author": {
+    "name": "RSmfOffice"
+  },
+  "interface": {
+    "displayName": "Codex 上下文监控",
+    "shortDescription": "跟随当前聊天显示上下文占用、剩余量与缓存命中率。",
+    "longDescription": "只统计 Codex 当前选中的单个会话。provider usage 作为精确锚点，新增模型可见内容按 DeepSeek Harness 的固定密度规则估算；支持随聊切换、拖动与位置记忆。",
+    "developerName": "RSmfOffice",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "显示 Codex 上下文监控",
+      "检查上下文监控状态"
+    ],
+    "brandColor": "#67D6FF",
+    "composerIcon": "./assets/logo.png",
+    "logo": "./assets/logo.png"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "context",
+    "token",
+    "cache"
+  ],
+  "mcpServers": "./.mcp.json"
+}

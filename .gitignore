@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+
+# Release/build output
+dist/
+build/
+*.zip
+
+# Local configuration, credentials, and runtime data
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+auth.json
+config.toml
+*.log
+*.tmp
+
+# Legacy performance-overlay project and local-only material
+/_backup/
+/assets/
+/lzov/
+/tools/
+/_codex_meter_preview.png
+/_fps_verify.ps1
+/_lz_monitor.ps1
+/_mon_tm.ps1
+/install.ps1
+/lz_perf_overlay.pyw
+/lz_toggle.pyw
+/修复Codex项目路径.bat
+/启动Codex上下文监控.cmd
+/HANDOFF_CODEX_CONTEXT_METER.md
+/codex-context-meter-plugin/runtime-pythonw.txt
+
+# IDE and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

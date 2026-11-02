@@ -1,0 +1,131 @@
+# Codex Context Meter
+
+[![Windows CI](https://github.com/RSmfOffice/codex-context-meter/actions/workflows/windows-ci.yml/badge.svg)](https://github.com/RSmfOffice/codex-context-meter/actions/workflows/windows-ci.yml)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+一个跟随 Codex 桌面窗口显示**当前单个会话**上下文状态的轻量悬浮组件。
+
+![Codex Context Meter](docs/images/codex-context-meter.png)
+
+## 功能
+
+- 显示当前上下文占用圆环、已用 token 和剩余 token。
+- 显示当前会话累计缓存命中率。
+- 自动跟随 Codex 当前选中的聊天，不跨会话累加。
+- 悬浮窗归属 Codex，不全局置顶，也不会遮挡其他应用。
+- 支持拖动、位置记忆、自动跟随和右键手动锁定会话。
+- Codex 最小化或退出时隐藏，恢复后重新出现。
+- 支持登录后自动启动、后台守护和 MCP 状态/启停工具。
+
+## 系统要求
+
+- Windows 10 或 Windows 11。
+- Codex 桌面版；当前会话识别依赖其 UI Automation 树。
+- Python 3.11+，并安装 Pillow。
+- 使用插件安装方式时，还需要 Codex CLI、Node.js 18+ 和 Windows PowerShell 5.1+。
+
+## 手动运行
+
+```powershell
+git clone https://github.com/RSmfOffice/codex-context-meter.git
+cd codex-context-meter
+python -m pip install -r requirements.txt
+pythonw.exe .\codex_context_meter.pyw
+```
+
+也可以双击 `start-codex-context-meter.cmd`。
+
+## 插件安装
+
+在仓库根目录运行 Windows PowerShell：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\codex-context-meter-plugin\scripts\install.ps1
+```
+
+安装器会：
+
+1. 将根目录 Python 源码同步到插件运行目录。
+2. 安装个人插件到 `%USERPROFILE%\plugins\codex-context-meter`。
+3. 注册登录计划任务 `Codex Context Meter`。
+4. 配置自动启动和 supervisor 健康恢复。
+
+首次安装后重启一次 Codex，使插件和 MCP 工具进入当前进程。
+
+## 使用
+
+| 操作 | 效果 |
+| --- | --- |
+| 左键拖动 | 在 Codex 客户区内移动并记忆位置 |
+| 左键单击 | 解除手动锁定并恢复自动跟随当前会话 |
+| 右键单击 | 查看精确数值、选择会话、恢复自动跟随或退出 |
+
+更完整的指标口径、刷新机制和限制见 [CODEX_CONTEXT_METER.md](CODEX_CONTEXT_METER.md)。
+
+## 计量方式
+
+上下文占用采用“provider 锚点 + 表层增量”：
+
+```text
+projected = last_token_usage.input_tokens
+          + estimate(response items after the latest usage anchor)
+```
+
+`token_count` 提供精确锚点；锚点之后尚未产生新 usage 的内容按固定密度估算，
+界面以 `~` 标记。下一次 provider usage 到达后会自动校准。
+
+缓存命中率为：
+
+```text
+total_token_usage.cached_input_tokens
+/ total_token_usage.input_tokens
+```
+
+只使用当前单个 `thread_id` 的累计值。
+
+## 架构
+
+- `codex_context_meter/`：统计、会话识别、Tk 界面和跟随逻辑。
+- `codex-context-meter-plugin/`：Codex 个人插件、MCP 服务、安装与守护脚本。
+- `window_follower.py`：独立 Win32 跟随子进程，异步移动现有窗口。
+- 统计和会话解析在后台线程运行；UI 只在内容变化时重绘。
+
+## 隐私
+
+- 不读取或保存 API key。
+- 只读取本机 Codex 会话 JSONL 中的标题、token usage 和模型可见内容结构。
+- 运行状态仅保存在 `%LOCALAPPDATA%\CodexContextMeter`。
+- 不上传会话内容、日志或配置。
+
+## 卸载
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File "$env:USERPROFILE\plugins\codex-context-meter\scripts\uninstall.ps1"
+```
+
+## 开发与验证
+
+```powershell
+python -m pip install -r requirements.txt
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\check.ps1
+```
+
+构建发布压缩包：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
+```
+
+## 已知限制
+
+- Codex 大版本升级可能改变 UI Automation 树，需要回归会话标题识别。
+- 同名会话只能按最近更新时间选择；可使用右键菜单手动锁定。
+- 锚点之后的增量是估算值，CJK、代码和复杂 JSON 可能有偏差。
+- compaction 后可能短暂显示“等待下一次 usage 校准”。
+- 当前仅支持 Windows。
+
+## License
+
+[MIT](LICENSE)
