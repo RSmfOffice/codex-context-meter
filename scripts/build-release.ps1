@@ -72,6 +72,10 @@ try {
         -LiteralPath (Join-Path $root 'docs\images\codex-context-meter.png') `
         -Destination (Join-Path $bundle 'docs\images\codex-context-meter.png') `
         -Force
+    Copy-Item `
+        -LiteralPath (Join-Path $root 'docs\HANDOFF-FORMAT.md') `
+        -Destination (Join-Path $bundle 'docs\HANDOFF-FORMAT.md') `
+        -Force
 
     if (Test-Path -LiteralPath $zipPath) {
         $resolvedReleaseRoot = [IO.Path]::GetFullPath($releaseRoot)

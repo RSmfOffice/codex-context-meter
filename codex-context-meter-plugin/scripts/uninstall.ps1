@@ -13,6 +13,17 @@ if ($task) {
 Try {
     & $codex.Source plugin remove 'codex-context-meter@personal' --json
 } Catch {}
+$agentsPath = Join-Path $env:USERPROFILE '.codex\AGENTS.md'
+if (Test-Path -LiteralPath $agentsPath) {
+    $content = [IO.File]::ReadAllText($agentsPath, [Text.Encoding]::UTF8)
+    $pattern = '(?s)\r?\n?<!-- CODEX_CONTEXT_METER_AGENTS:START -->.*?<!-- CODEX_CONTEXT_METER_AGENTS:END -->\r?\n?'
+    $updated = [regex]::Replace($content, $pattern, '')
+    [IO.File]::WriteAllText(
+        $agentsPath,
+        $updated.TrimEnd() + "`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+}
 if (Test-Path -LiteralPath $destination) {
     Move-Item -LiteralPath $destination -Destination ($destination + '.removed-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))
 }

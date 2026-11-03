@@ -157,6 +157,7 @@ class SessionSnapshot:
     min_failure_payload_bytes: int = 0
     request_too_large: bool = False
     request_error: str = ""
+    workspace_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -194,6 +195,7 @@ class SessionStatsTracker:
         self.global_state_path = self.codex_home / ".codex-global-state.json"
         self._cache: dict[str, _FileResult] = {}
         self._payload_cache: dict[str, _PayloadState] = {}
+        self._workspace_cache: dict[str, str] = {}
         self._index_cache: tuple[int, dict[str, str], dict[str, float]] | None = None
         self._activity_cache: tuple[int, dict[str, float]] | None = None
         self._session_files_cache: tuple[float, list[Path]] | None = None
@@ -404,9 +406,34 @@ class SessionStatsTracker:
                 min_failure_payload_bytes=payload.min_failure_payload_bytes,
                 request_too_large=payload.request_too_large,
                 request_error=payload.request_error,
+                workspace_path=self._session_workspace(path),
             )
         self._cache[str(path)] = _FileResult(snapshot, stat.st_mtime_ns, stat.st_size)
         return snapshot
+
+    def _session_workspace(self, path: Path) -> str:
+        key = str(path)
+        if key in self._workspace_cache:
+            return self._workspace_cache[key]
+        workspace = ""
+        try:
+            with path.open("rb") as stream:
+                prefix = stream.read(256 * 1024)
+            for raw in prefix.splitlines():
+                try:
+                    item = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(item, dict) or item.get("type") != "session_meta":
+                    continue
+                payload = item.get("payload")
+                if isinstance(payload, dict) and isinstance(payload.get("cwd"), str):
+                    workspace = payload["cwd"]
+                break
+        except OSError:
+            pass
+        self._workspace_cache[key] = workspace
+        return workspace
 
     def _payload_stats(self, path: Path, stat: os.stat_result) -> _PayloadState:
         key = str(path)

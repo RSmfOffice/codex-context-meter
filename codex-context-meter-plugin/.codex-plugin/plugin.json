@@ -1,6 +1,6 @@
 {
   "name": "codex-context-meter",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "随 Codex 启动的单会话上下文圆环、剩余 token 与缓存命中率悬浮组件。",
   "author": {
     "name": "RSmfOffice"

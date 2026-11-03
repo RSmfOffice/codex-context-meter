@@ -2,6 +2,21 @@
 
 本项目遵循语义化版本。
 
+## [0.1.3] - 2026-11-03
+
+### Added
+
+- 项目工作目录根入口 `HANDOFF.md` 和 `.codex/handoffs` 完整链镜像。
+- 无项目目录时写入 `%CODEX_HOME%\handoffs\HANDOFF.md` 全局入口。
+- 从 Codex `session_meta.payload.cwd` 自动识别当前工作目录。
+- 全局 `AGENTS.md` 自动发现规则和项目入口优先策略。
+- 标准交接格式与恢复协议文档。
+
+### Changed
+
+- 全局交接指针记录 `workspacePath`，不匹配时不得自动应用。
+- 交接更新使用托管区块，不覆盖已有 `HANDOFF.md` 内容。
+
 ## [0.1.2] - 2026-11-02
 
 ### Added

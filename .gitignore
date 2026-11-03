@@ -39,6 +39,8 @@ config.toml
 /启动Codex上下文监控.cmd
 /HANDOFF_CODEX_CONTEXT_METER.md
 /codex-context-meter-plugin/runtime-pythonw.txt
+/HANDOFF.md
+/.codex/handoffs/
 
 # IDE and OS metadata
 .vscode/

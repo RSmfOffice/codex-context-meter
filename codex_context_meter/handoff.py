@@ -12,10 +12,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-HANDOFF_VERSION = 1
+HANDOFF_VERSION = 2
 MAX_FIELD_CHARS = 20_000
 MAX_LIST_ITEMS = 30
 MAX_ITEM_CHARS = 2_000
+DISCOVERY_START = "<!-- CODEX_CONTEXT_METER_HANDOFF:START -->"
+DISCOVERY_END = "<!-- CODEX_CONTEXT_METER_HANDOFF:END -->"
 
 
 def _text(value: Any, fallback: str = "") -> str:
@@ -64,6 +66,160 @@ def _atomic_write(path: Path, content: str) -> None:
     temporary.replace(path)
 
 
+def _codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).resolve()
+
+
+def _safe_workspace(value: Any) -> Path | None:
+    if isinstance(value, Path):
+        raw_value = str(value)
+    elif isinstance(value, str):
+        raw_value = value
+    else:
+        return None
+    if not raw_value.strip():
+        return None
+    try:
+        path = Path(raw_value).expanduser().resolve()
+    except (OSError, ValueError):
+        return None
+    if not path.is_dir() or path.parent == path:
+        return None
+    blocked = {
+        Path.home().resolve(),
+        _codex_home(),
+    }
+    for name in ("LOCALAPPDATA", "APPDATA", "ProgramFiles", "WINDIR"):
+        raw = os.environ.get(name)
+        if raw:
+            try:
+                blocked.add(Path(raw).resolve())
+            except (OSError, ValueError):
+                pass
+    return None if path in blocked else path
+
+
+def _upsert_managed_block(path: Path, block: str) -> None:
+    try:
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        existing = ""
+    wrapped = f"{DISCOVERY_START}\n{block.rstrip()}\n{DISCOVERY_END}"
+    pattern = re.compile(
+        re.escape(DISCOVERY_START) + r".*?" + re.escape(DISCOVERY_END),
+        re.DOTALL,
+    )
+    if pattern.search(existing):
+        content = pattern.sub(lambda _match: wrapped, existing, count=1)
+    elif existing.strip():
+        content = existing.rstrip() + "\n\n" + wrapped + "\n"
+    else:
+        content = "# Handoff\n\n" + wrapped + "\n"
+    _atomic_write(path, content)
+
+
+def _publish_discovery(
+    *,
+    workspace: Path | None,
+    chain_id: str,
+    report_path: Path,
+    chain_context_path: Path,
+    index_path: Path,
+    latest: dict[str, Any],
+    status: str,
+    summary: str,
+    next_action: str,
+) -> dict[str, Any]:
+    warnings = []
+    if workspace:
+        mirror_root = workspace / ".codex" / "handoffs" / "codex-context-meter"
+        local_pointer = workspace / "HANDOFF.md"
+        prefix = ".codex/handoffs/codex-context-meter"
+    else:
+        mirror_root = _codex_home() / "handoffs" / "codex-context-meter"
+        local_pointer = _codex_home() / "handoffs" / "HANDOFF.md"
+        prefix = str(mirror_root)
+    try:
+        mirror_root.mkdir(parents=True, exist_ok=True)
+        _atomic_write(
+            mirror_root / "chain-context.md",
+            chain_context_path.read_text(encoding="utf-8"),
+        )
+        _atomic_write(
+            mirror_root / "latest-handoff.md",
+            report_path.read_text(encoding="utf-8"),
+        )
+        mirror_index = json.loads(index_path.read_text(encoding="utf-8"))
+        mirror_index["canonicalChainContextPath"] = str(chain_context_path)
+        mirror_index["localChainContext"] = str(mirror_root / "chain-context.md")
+        mirror_index["localLatestHandoff"] = str(mirror_root / "latest-handoff.md")
+        _atomic_write(
+            mirror_root / "index.json",
+            json.dumps(mirror_index, ensure_ascii=False, indent=2) + "\n",
+        )
+        mirror_latest = dict(latest)
+        mirror_latest["canonicalChainContextPath"] = str(chain_context_path)
+        mirror_latest["localChainContext"] = str(mirror_root / "chain-context.md")
+        mirror_latest["localLatestHandoff"] = str(mirror_root / "latest-handoff.md")
+        _atomic_write(
+            mirror_root / "latest.json",
+            json.dumps(mirror_latest, ensure_ascii=False, indent=2) + "\n",
+        )
+        block = "\n".join(
+            [
+                "# Codex Context Meter 活动交接",
+                "",
+                f"- 交接链：`{chain_id}`",
+                f"- 状态：`{status}`",
+                f"- 更新：{latest['createdAt']}",
+                f"- 完整历史链：`{prefix}/chain-context.md`",
+                f"- 最新快照：`{prefix}/latest-handoff.md`",
+                f"- 索引：`{prefix}/index.json`",
+                f"- 原始工作目录：`{workspace or '无项目工作目录'}`",
+                "",
+                "新会话开始前必须完整读取完整历史链；内容较长时分段读完全部历史，"
+                "不能只读最新快照或摘要替代。",
+                "",
+                f"当前目标：{summary}",
+                "",
+                f"下一步：{next_action}",
+            ]
+        )
+        _upsert_managed_block(local_pointer, block)
+    except OSError as error:
+        warnings.append(f"workspace mirror unavailable: {type(error).__name__}: {error}")
+
+    global_pointer = _codex_home() / "handoffs" / "HANDOFF.md"
+    global_block = "\n".join(
+        [
+            "# Codex Context Meter 最近交接",
+            "",
+            f"- 交接链：`{chain_id}`",
+            f"- 工作目录：`{workspace or '无项目工作目录'}`",
+            f"- 状态：`{status}`",
+            f"- 项目内入口：`{workspace / 'HANDOFF.md' if workspace else '无'}`",
+            f"- 权威完整链：`{chain_context_path}`",
+            f"- 权威索引：`{index_path}`",
+            f"- 完整链镜像：`{mirror_root / 'chain-context.md'}`",
+            f"- 最新快照镜像：`{mirror_root / 'latest-handoff.md'}`",
+            "",
+            "仅在当前工作目录与记录一致，或用户明确要求恢复该任务时读取。",
+            "读取时必须完整读取完整链档案，不得遗漏旧交接。",
+        ]
+    )
+    try:
+        _upsert_managed_block(global_pointer, global_block)
+    except OSError as error:
+        warnings.append(f"global pointer unavailable: {type(error).__name__}: {error}")
+    return {
+        "workspace": str(workspace) if workspace else None,
+        "pointerPath": str(local_pointer),
+        "mirrorRoot": str(mirror_root),
+        "globalPointerPath": str(global_pointer),
+        "warnings": warnings,
+    }
+
+
 def create_handoff(
     *,
     directory: str | Path,
@@ -82,8 +238,10 @@ def create_handoff(
     next_action: str = "",
     reason: str = "",
     metrics: dict[str, Any] | None = None,
+    workspace_root: str | Path | None = None,
 ) -> dict[str, Any]:
     root = Path(directory).expanduser().resolve()
+    workspace = _safe_workspace(workspace_root)
     chain_id = _chain_id(chain_name, thread_title)
     chain_dir = root / "chains" / chain_id
     latest_path = chain_dir / "latest.json"
@@ -332,6 +490,17 @@ def create_handoff(
     _atomic_write(chain_context_path, "\n".join(archive))
     _atomic_write(index_path, json.dumps(index, ensure_ascii=False, indent=2) + "\n")
     _atomic_write(latest_path, json.dumps(latest, ensure_ascii=False, indent=2) + "\n")
+    discovery = _publish_discovery(
+        workspace=workspace,
+        chain_id=chain_id,
+        report_path=report_path,
+        chain_context_path=chain_context_path,
+        index_path=index_path,
+        latest=latest,
+        status=status_text,
+        summary=summary_text,
+        next_action=next_text,
+    )
     return {
         "ok": True,
         "path": str(report_path),
@@ -343,6 +512,7 @@ def create_handoff(
         "chainContextPath": str(chain_context_path),
         "indexPath": str(index_path),
         "coverageComplete": True,
+        **discovery,
     }
 
 
@@ -387,6 +557,7 @@ def main(argv: list[str] | None = None) -> int:
             next_action=_text(payload.get("nextAction"), ""),
             reason=_text(payload.get("reason"), "manual"),
             metrics=state,
+            workspace_root=state.get("workspacePath"),
         )
         sys.stdout.write(json.dumps(result, ensure_ascii=True) + "\n")
         return 0

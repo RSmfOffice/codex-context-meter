@@ -17,6 +17,39 @@ $powerShell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $vbs = Join-Path $Destination 'scripts\launch-hidden.vbs'
 
+function Set-ManagedAgentInstructions([string]$Path, [string]$Block) {
+    $parent = [IO.Path]::GetDirectoryName($Path)
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    $content = if (Test-Path -LiteralPath $Path) {
+        [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
+    } else {
+        ''
+    }
+    $start = '<!-- CODEX_CONTEXT_METER_AGENTS:START -->'
+    $end = '<!-- CODEX_CONTEXT_METER_AGENTS:END -->'
+    $wrapped = $start + "`n" + $Block.Trim() + "`n" + $end
+    $startIndex = $content.IndexOf($start, [StringComparison]::Ordinal)
+    $endIndex = if ($startIndex -ge 0) {
+        $content.IndexOf($end, $startIndex, [StringComparison]::Ordinal)
+    } else {
+        -1
+    }
+    if ($startIndex -ge 0 -and $endIndex -ge $startIndex) {
+        $content = (
+            $content.Substring(0, $startIndex) +
+            $wrapped +
+            $content.Substring($endIndex + $end.Length)
+        )
+    }
+    elseif ($content.Trim()) {
+        $content = $content.TrimEnd() + "`n`n" + $wrapped + "`n"
+    }
+    else {
+        $content = "# Global Instructions`n`n" + $wrapped + "`n"
+    }
+    [IO.File]::WriteAllText($Path, $content, [Text.UTF8Encoding]::new($false))
+}
+
 & $python.Source -c "import PIL"
 if ($LASTEXITCODE -ne 0) {
     throw 'Pillow is required. Run: python -m pip install -r requirements.txt'
@@ -73,6 +106,13 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw 'Codex could not install the personal context-meter plugin.'
     }
+    $agentInstructions = [IO.File]::ReadAllText(
+        (Join-Path $PSScriptRoot 'handoff-agent-block.md'),
+        [Text.Encoding]::UTF8
+    )
+    Set-ManagedAgentInstructions `
+        -Path (Join-Path $env:USERPROFILE '.codex\AGENTS.md') `
+        -Block $agentInstructions
     $pluginResult
 }
 finally {

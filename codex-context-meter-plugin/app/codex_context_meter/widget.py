@@ -245,6 +245,7 @@ def write_state(
         "ok": True,
         "pid": os.getpid(),
         "pythonExecutable": sys.executable,
+        "workspacePath": snapshot.workspace_path if snapshot else "",
         "threadId": thread_id,
         "activeThreadTitle": active_title,
         "activeThreadError": active_error,
@@ -1183,6 +1184,7 @@ class ContextMeterWidget:
                 next_action="补充当前任务的下一步，然后在新会话完整读取交接链。",
                 reason=reason,
                 metrics=metrics,
+                workspace_root=snapshot.workspace_path if snapshot else None,
             )
             log(
                 "handoff written: "
@@ -1194,6 +1196,7 @@ class ContextMeterWidget:
                 (
                     f"当前快照：\n{result['path']}\n\n"
                     f"完整历史链：\n{result['chainContextPath']}\n\n"
+                    f"项目入口：\n{result['pointerPath']}\n\n"
                     f"交接链：{result['chainId']}"
                 ),
             )

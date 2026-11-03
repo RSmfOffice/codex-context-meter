@@ -102,6 +102,7 @@ total_token_usage.cached_input_tokens
 - `codex-context-meter-plugin/`：Codex 个人插件、MCP 服务、安装与守护脚本。
 - `window_follower.py`：独立 Win32 跟随子进程，异步移动现有窗口。
 - `handoff.py`：结构化交接链、完整历史归档和索引。
+- `docs/HANDOFF-FORMAT.md`：agent 自动发现顺序、标准格式和恢复协议。
 - 统计和会话解析在后台线程运行；UI 只在内容变化时重绘。
 
 ## 连续交接
@@ -120,6 +121,16 @@ MCP 工具 `context_meter_handoff` 可提交更完整的摘要、决策、已完
 新会话必须完整读取 `chain-context.md` 后再继续，不能只读最新一份或用摘要
 替代历史，因此多轮转接不会遗漏此前上下文。默认位于
 `%LOCALAPPDATA%\CodexContextMeter\handoffs\chains`。
+
+为便于 agent 自动发现：
+
+- 有工作目录时，会在项目根写入托管区块 `HANDOFF.md`，并镜像完整链到
+  `.codex/handoffs/codex-context-meter/`。
+- 无有效项目目录时，会回退到 `%CODEX_HOME%\handoffs\HANDOFF.md`。
+- 项目内入口优先于全局入口；全局入口会记录 `workspacePath`，不与当前工作目录
+  匹配时不得自动套用。
+
+完整规范见 [HANDOFF-FORMAT.md](docs/HANDOFF-FORMAT.md)。
 
 ## 隐私
 

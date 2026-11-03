@@ -42,6 +42,10 @@ Codex，让 MCP 工具和插件界面进入当前进程。
 - `context_meter_handoff`：按稳定 `chainId` 生成当前快照、完整累计链档案和全量索引。
 - 悬浮窗右键菜单：可生成本地 Markdown 交接报告，支持多对话连续转接。
 
+交接生成后会在项目根更新 `HANDOFF.md`，并镜像完整链到
+`.codex/handoffs/codex-context-meter/`。没有项目目录时回退到
+`%CODEX_HOME%\handoffs\HANDOFF.md`。
+
 ## 卸载
 
 ```powershell

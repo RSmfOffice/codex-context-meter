@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from codex_context_meter.handoff import create_handoff
 from codex_context_meter.session_stats import (
@@ -30,13 +32,19 @@ class SessionStatsTrackerTests(unittest.TestCase):
     def test_projects_context_from_anchor_and_reports_cache_rate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
+            project = home / "project"
+            project.mkdir()
             session_dir = home / "sessions" / "2026" / "11" / "02"
             session_dir.mkdir(parents=True)
             session_path = session_dir / f"rollout-2026-11-02T20-00-00-{THREAD_ID}.jsonl"
             rows = [
                 {
                     "type": "session_meta",
-                    "payload": {"id": THREAD_ID, "model_provider": "deepseek"},
+                    "payload": {
+                        "id": THREAD_ID,
+                        "cwd": str(project),
+                        "model_provider": "deepseek",
+                    },
                 },
                 {
                     "type": "turn_context",
@@ -114,6 +122,7 @@ class SessionStatsTrackerTests(unittest.TestCase):
             self.assertIsNone(tracker.thread_id_for_title("不存在"))
             self.assertEqual(snapshot.thread_id, THREAD_ID)
             self.assertEqual(snapshot.title, "测试会话")
+            self.assertEqual(snapshot.workspace_path, str(project))
             self.assertEqual(snapshot.anchor_tokens, 5_000)
             self.assertGreater(snapshot.surface_delta_tokens, 0)
             self.assertEqual(
@@ -351,10 +360,24 @@ class SessionStatsTrackerTests(unittest.TestCase):
     def test_payload_budget_and_handoff_report(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
+            project = home / "project"
+            project.mkdir()
+            codex_home = home / "codex-home"
+            codex_home.mkdir()
+            environment = patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(codex_home)},
+            )
+            environment.start()
+            self.addCleanup(environment.stop)
             session_dir = home / "sessions" / "2026" / "11" / "02"
             session_dir.mkdir(parents=True)
             session_path = session_dir / f"rollout-2026-11-02T20-00-00-{THREAD_ID}.jsonl"
             rows = [
+                {
+                    "type": "session_meta",
+                    "payload": {"id": THREAD_ID, "cwd": str(project)},
+                },
                 {"type": "turn_context", "payload": {"model": "deepseek-flash"}},
                 {
                     "type": "event_msg",
@@ -422,6 +445,7 @@ class SessionStatsTrackerTests(unittest.TestCase):
                 verification=["验证通过"],
                 next_action="开始第二阶段",
                 reason="request-413",
+                workspace_root=project,
                 metrics={
                     "projectedTokens": critical.projected_tokens,
                     "contextWindow": critical.context_window,
@@ -451,6 +475,7 @@ class SessionStatsTrackerTests(unittest.TestCase):
                 pending=["继续第三阶段"],
                 next_action="开始第三阶段",
                 reason="manual",
+                workspace_root=project,
                 metrics={"percent": 12.5},
             )
             self.assertEqual(second["chainId"], first["chainId"])
@@ -463,9 +488,27 @@ class SessionStatsTrackerTests(unittest.TestCase):
             self.assertIn("完成第二阶段", archive)
             self.assertIn("不得跳过或仅用摘要替代", archive)
             index = json.loads(Path(second["indexPath"]).read_text(encoding="utf-8"))
+            self.assertEqual(index["handoffVersion"], 2)
             self.assertTrue(index["coverageComplete"])
             self.assertEqual(index["handoffCount"], 2)
             self.assertEqual(len(index["handoffs"]), 2)
+            project_pointer = project / "HANDOFF.md"
+            self.assertTrue(project_pointer.exists())
+            pointer_text = project_pointer.read_text(encoding="utf-8")
+            self.assertIn("CODEX_CONTEXT_METER_HANDOFF:START", pointer_text)
+            self.assertIn(second["chainId"], pointer_text)
+            project_archive = (
+                project
+                / ".codex"
+                / "handoffs"
+                / "codex-context-meter"
+                / "chain-context.md"
+            )
+            self.assertTrue(project_archive.exists())
+            mirror_text = project_archive.read_text(encoding="utf-8")
+            self.assertIn("完成第一阶段", mirror_text)
+            self.assertIn("完成第二阶段", mirror_text)
+            self.assertTrue((codex_home / "handoffs" / "HANDOFF.md").exists())
 
 
 class OverlayGeometryTests(unittest.TestCase):
