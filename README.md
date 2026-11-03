@@ -12,6 +12,7 @@
 - 显示当前上下文占用圆环、已用 token 和剩余 token。
 - 显示当前会话累计缓存命中率。
 - 检测图片 data URI 载荷；provider 返回 413 时单独显示请求体超限，不误报为上下文接近上限。
+- 支持跨多个 Codex 对话连续转接，生成结构化快照、完整历史链和全部交接索引。
 - 自动跟随 Codex 当前选中的聊天，不跨会话累加。
 - 悬浮窗归属 Codex，不全局置顶，也不会遮挡其他应用。
 - 支持拖动、位置记忆、自动跟随和右键手动锁定会话。
@@ -100,7 +101,25 @@ total_token_usage.cached_input_tokens
 - `codex_context_meter/`：统计、会话识别、Tk 界面和跟随逻辑。
 - `codex-context-meter-plugin/`：Codex 个人插件、MCP 服务、安装与守护脚本。
 - `window_follower.py`：独立 Win32 跟随子进程，异步移动现有窗口。
+- `handoff.py`：结构化交接链、完整历史归档和索引。
 - 统计和会话解析在后台线程运行；UI 只在内容变化时重绘。
+
+## 连续交接
+
+悬浮窗右键“生成交接报告…”可以让同一任务使用相同的交接链名称。
+MCP 工具 `context_meter_handoff` 可提交更完整的摘要、决策、已完成项、
+待办、关键文件、验证记录和下一步。
+
+每个交接链包含：
+
+- `latest.json`：最新交接元数据。
+- `index.json`：该链全部交接的顺序索引。
+- `chain-context.md`：累计全部交接的完整上下文。
+- `hf-*.md`：每次交接的结构化当前快照。
+
+新会话必须完整读取 `chain-context.md` 后再继续，不能只读最新一份或用摘要
+替代历史，因此多轮转接不会遗漏此前上下文。默认位于
+`%LOCALAPPDATA%\CodexContextMeter\handoffs\chains`。
 
 ## 隐私
 

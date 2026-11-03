@@ -13,10 +13,11 @@ from ctypes import wintypes
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from .active_thread import ActiveThreadMonitor
+from .handoff import create_handoff
 from .session_stats import SessionSnapshot, SessionStatsTracker
 
 
@@ -243,6 +244,7 @@ def write_state(
     payload = {
         "ok": True,
         "pid": os.getpid(),
+        "pythonExecutable": sys.executable,
         "threadId": thread_id,
         "activeThreadTitle": active_title,
         "activeThreadError": active_error,
@@ -320,84 +322,6 @@ def payload_risk(
     if current >= warning_bytes:
         return "warning"
     return "normal"
-
-
-def write_handoff_report(
-    snapshot: SessionSnapshot | None,
-    thread_id: str | None,
-    active_title: str,
-    warning_bytes: int = PAYLOAD_WARNING_BYTES,
-    critical_bytes: int = PAYLOAD_CRITICAL_BYTES,
-    directory: Path | None = None,
-) -> Path:
-    target_dir = directory or (APP_DIR / "handoffs")
-    target_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    short_id = (thread_id or "unknown")[:8]
-    path = target_dir / f"handoff-{stamp}-{short_id}.md"
-    risk = payload_risk(snapshot, warning_bytes, critical_bytes)
-    title = (snapshot.title if snapshot else "") or active_title or "未识别会话"
-    lines = [
-        "# Codex 交接报告",
-        "",
-        f"- 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"- 会话：{title}",
-        f"- thread_id：`{thread_id or 'unknown'}`",
-        f"- 载荷状态：`{risk}`",
-        "",
-        "## 当前指标",
-        "",
-    ]
-    if snapshot:
-        lines += [
-            f"- 上下文：{snapshot.projected_tokens:,} / {snapshot.context_window:,} token（{snapshot.percent:.2f}%）",
-            f"- 剩余：{snapshot.remaining_tokens:,} token",
-            f"- 缓存命中率：{cache_rate_text(snapshot)}",
-            f"- 估算请求体：{compact_payload_bytes(snapshot.request_payload_bytes)}",
-            f"- 安全预警/停止预算：{compact_payload_bytes(warning_bytes)} / {compact_payload_bytes(critical_bytes)}",
-            f"- 图片：{snapshot.image_count} 张，载荷 {compact_payload_bytes(snapshot.image_payload_bytes)}",
-            "- 本会话已验证请求体："
-            + (
-                compact_payload_bytes(snapshot.max_success_payload_bytes)
-                if snapshot.max_success_payload_bytes
-                else "尚未观测"
-            ),
-            "- 本会话已知失败请求体："
-            + (
-                compact_payload_bytes(snapshot.min_failure_payload_bytes)
-                if snapshot.min_failure_payload_bytes
-                else "尚未观测"
-            ),
-            f"- 最近请求超限：{'是' if snapshot.request_too_large else '否'}",
-        ]
-        if snapshot.request_error:
-            lines.append(f"- provider 错误：`{snapshot.request_error}`")
-    else:
-        lines.append("- 暂无可用的上下文快照。")
-    lines += [
-        "",
-        "## 工作摘要",
-        "",
-        "<!-- 补充正在完成的目标、已完成内容和关键决策。 -->",
-        "",
-        "## 待办与下一步",
-        "",
-        "<!-- 补充剩余步骤。建议在新会话中只附必要文件与少量压缩图片。 -->",
-        "",
-        "## 关键文件与产物",
-        "",
-        "<!-- 列出新会话需要使用的文件路径、产物和验证结果。 -->",
-        "",
-        "## 恢复建议",
-        "",
-        "- 不要在 413 后继续向同一图片密集会话追加附件。",
-        "- 新建会话，只携带必要文件和压缩后的关键图片。",
-        "- 图片核对尽量先形成文字结论，再进入后续生成任务。",
-    ]
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    temporary.replace(path)
-    return path
 
 
 def process_name(pid: int) -> str:
@@ -1171,7 +1095,7 @@ class ContextMeterWidget:
                     ),
                     state="disabled",
                 )
-            menu.add_command(label="生成交接报告", command=self._write_handoff)
+            menu.add_command(label="生成交接报告…", command=self._write_handoff)
             menu.add_separator()
         menu.add_command(label="自动跟随当前选中会话", command=self._reset_auto)
         sessions = tk.Menu(menu, tearoff=False)
@@ -1205,17 +1129,75 @@ class ContextMeterWidget:
         critical_bytes = int(
             self.config.get("payload_critical_bytes", PAYLOAD_CRITICAL_BYTES)
         )
+        title = (
+            self.snapshot.title
+            if self.snapshot
+            else self.active_thread.title or "未识别会话"
+        )
+        chain_name = simpledialog.askstring(
+            "生成交接报告",
+            "交接链名称（同一任务多次转接请保持一致）：",
+            initialvalue=title,
+            parent=self.root,
+        )
+        if not chain_name:
+            return
+        snapshot = self.snapshot
+        metrics = {
+            "projectedTokens": snapshot.projected_tokens if snapshot else 0,
+            "contextWindow": snapshot.context_window if snapshot else 0,
+            "remainingTokens": snapshot.remaining_tokens if snapshot else 0,
+            "percent": snapshot.percent if snapshot else 0,
+            "cacheHitRate": (
+                snapshot.cache_hit_rate * 100
+                if snapshot and snapshot.cache_hit_rate is not None
+                else 0
+            ),
+            "requestPayloadBytes": snapshot.request_payload_bytes if snapshot else 0,
+            "maxSuccessfulRequestBytes": (
+                snapshot.max_success_payload_bytes if snapshot else 0
+            ),
+            "minFailedRequestBytes": (
+                snapshot.min_failure_payload_bytes if snapshot else 0
+            ),
+            "imageCount": snapshot.image_count if snapshot else 0,
+            "imagePayloadBytes": snapshot.image_payload_bytes if snapshot else 0,
+            "payloadRisk": payload_risk(snapshot, warning_bytes, critical_bytes),
+            "requestTooLarge": snapshot.request_too_large if snapshot else False,
+        }
+        reason = (
+            "request-413"
+            if snapshot and snapshot.request_too_large
+            else "request-payload"
+            if metrics["payloadRisk"] in {"warning", "critical"}
+            else "manual"
+        )
         try:
-            path = write_handoff_report(
-                self.snapshot,
-                self.snapshot_thread_id,
-                self.active_thread.title,
-                warning_bytes,
-                critical_bytes,
+            result = create_handoff(
+                directory=APP_DIR / "handoffs",
+                chain_name=chain_name,
+                thread_id=self.snapshot_thread_id,
+                thread_title=title,
+                summary=f"继续完成任务：{title}",
+                status="paused",
+                next_action="补充当前任务的下一步，然后在新会话完整读取交接链。",
+                reason=reason,
+                metrics=metrics,
             )
-            log(f"handoff written: {path}")
-            messagebox.showinfo("交接报告", f"已保存到：\n{path}")
-        except OSError as error:
+            log(
+                "handoff written: "
+                f"{result['path']} chain={result['chainId']} "
+                f"count={result['handoffCount']}"
+            )
+            messagebox.showinfo(
+                "交接报告",
+                (
+                    f"当前快照：\n{result['path']}\n\n"
+                    f"完整历史链：\n{result['chainContextPath']}\n\n"
+                    f"交接链：{result['chainId']}"
+                ),
+            )
+        except Exception as error:
             log(f"write handoff failed: {error}")
             messagebox.showerror("交接报告", f"保存失败：\n{error}")
 

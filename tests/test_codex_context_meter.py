@@ -6,6 +6,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from codex_context_meter.handoff import create_handoff
 from codex_context_meter.session_stats import (
     ROLE_OVERHEAD,
     SessionStatsTracker,
@@ -18,7 +19,6 @@ from codex_context_meter.widget import (
     WIDTH,
     clamp_overlay_position,
     payload_risk,
-    write_handoff_report,
 )
 from codex_context_meter.window_follower import translated_position
 
@@ -409,16 +409,61 @@ class SessionStatsTrackerTests(unittest.TestCase):
             self.assertEqual(payload_risk(beyond_known), "warning")
             self.assertEqual(payload_risk(near_failure), "critical")
 
-            report = write_handoff_report(
-                critical,
-                THREAD_ID,
-                "测试会话",
+            first = create_handoff(
                 directory=home / "handoffs",
+                chain_name="word-v2.4",
+                thread_id=THREAD_ID,
+                thread_title="测试会话",
+                summary="完成第一阶段",
+                completed=["完成第一阶段"],
+                pending=["继续第二阶段"],
+                decisions=["保留原格式"],
+                files=["output.docx"],
+                verification=["验证通过"],
+                next_action="开始第二阶段",
+                reason="request-413",
+                metrics={
+                    "projectedTokens": critical.projected_tokens,
+                    "contextWindow": critical.context_window,
+                    "remainingTokens": critical.remaining_tokens,
+                    "percent": critical.percent,
+                    "requestPayloadBytes": critical.request_payload_bytes,
+                    "maxSuccessfulRequestBytes": critical.max_success_payload_bytes,
+                    "minFailedRequestBytes": critical.min_failure_payload_bytes,
+                    "imageCount": critical.image_count,
+                    "imagePayloadBytes": critical.image_payload_bytes,
+                    "payloadRisk": "critical",
+                },
             )
+            report = Path(first["path"])
             text = report.read_text(encoding="utf-8")
-            self.assertIn("Codex 交接报告", text)
+            self.assertIn("交接快照", text)
             self.assertIn(THREAD_ID, text)
-            self.assertIn("载荷状态：`critical`", text)
+            self.assertIn("完成第一阶段", text)
+
+            second = create_handoff(
+                directory=home / "handoffs",
+                chain_name="word-v2.4",
+                thread_id="01a187b3-00ff-7270-909e-c60b1d3e8150",
+                thread_title="测试会话二",
+                summary="完成第二阶段",
+                completed=["完成第二阶段"],
+                pending=["继续第三阶段"],
+                next_action="开始第三阶段",
+                reason="manual",
+                metrics={"percent": 12.5},
+            )
+            self.assertEqual(second["chainId"], first["chainId"])
+            self.assertEqual(second["handoffCount"], 2)
+            self.assertEqual(second["previousHandoff"], Path(first["path"]).relative_to(home / "handoffs").as_posix())
+            archive = Path(second["chainContextPath"]).read_text(encoding="utf-8")
+            self.assertIn("完成第一阶段", archive)
+            self.assertIn("完成第二阶段", archive)
+            self.assertIn("不得跳过或仅用摘要替代", archive)
+            index = json.loads(Path(second["indexPath"]).read_text(encoding="utf-8"))
+            self.assertTrue(index["coverageComplete"])
+            self.assertEqual(index["handoffCount"], 2)
+            self.assertEqual(len(index["handoffs"]), 2)
 
 
 class OverlayGeometryTests(unittest.TestCase):
