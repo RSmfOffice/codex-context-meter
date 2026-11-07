@@ -9,7 +9,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const APP_ROOT = path.join(ROOT, 'app');
 const DATA_DIR = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'CodexContextMeter');
 const STATE_FILE = path.join(DATA_DIR, 'widget-state.json');
-const VERSION = '0.1.3';
+const VERSION = '0.1.5';
 const VBS = path.join(ROOT, 'scripts', 'launch-hidden.vbs');
 const STOP_SCRIPT = path.join(ROOT, 'scripts', 'stop.ps1');
 

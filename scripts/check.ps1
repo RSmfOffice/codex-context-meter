@@ -85,6 +85,7 @@ try {
         'active_thread.py',
         'handoff.py',
         'session_stats.py',
+        'team_dashboard.py',
         'widget.py',
         'window_follower.py'
     )
@@ -99,7 +100,7 @@ try {
     @{
         ok = $true
         version = $version
-        pythonTests = 10
+        pythonTests = 15
     } | ConvertTo-Json
 }
 finally {

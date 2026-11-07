@@ -1,0 +1,20 @@
+{
+  "name": "codex-tools",
+  "interface": {
+    "displayName": "Codex Tools"
+  },
+  "plugins": [
+    {
+      "name": "codex-context-meter",
+      "source": {
+        "source": "local",
+        "path": "./codex-context-meter-plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

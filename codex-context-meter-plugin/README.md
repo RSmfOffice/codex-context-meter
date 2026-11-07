@@ -13,7 +13,8 @@ git clone https://github.com/RSmfOffice/codex-context-meter.git
 cd codex-context-meter
 python -m pip install -r requirements.txt
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File .\codex-context-meter-plugin\scripts\install.ps1
+  -File .\codex-context-meter-plugin\scripts\install.ps1 `
+  -TeamBoardRoot ..\codex-team-board
 ```
 
 安装器会：
@@ -23,6 +24,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 3. 写入个人 marketplace 条目并执行 `codex plugin add`。
 4. 注册登录级计划任务 `Codex Context Meter`。
 5. 启动 VBS 快路径和 supervisor；前者直接拉起组件，后者负责健康检查与恢复。
+6. 写入 `CODEX_TEAM_BOARD_ROOT`、`CODEX_TEAM_DASHBOARD_URL` 和插件配置。
 
 从发布压缩包安装时，请在解压目录按相同方式运行安装器。首次安装后重启一次
 Codex，让 MCP 工具和插件界面进入当前进程。
@@ -41,6 +43,24 @@ Codex，让 MCP 工具和插件界面进入当前进程。
 - `context_meter_stop`：暂停组件，直到当前 Codex 进程退出。
 - `context_meter_handoff`：按稳定 `chainId` 生成当前快照、完整累计链档案和全量索引。
 - 悬浮窗右键菜单：可生成本地 Markdown 交接报告，支持多对话连续转接。
+- “打开 Codex 团队看板”：检测本地看板，未运行时后台启动，再通过默认浏览器打开。
+- 上下文接近本会话历史 compaction 比例时显示“接近压缩/即将压缩”。
+- 请求体接近本会话已知 413 失败边界时提前显示风险。
+
+看板默认地址为 `http://127.0.0.1:8765`。可在
+`%LOCALAPPDATA%\CodexContextMeter\config.json` 中设置：
+
+```json
+{
+  "team_dashboard_url": "http://127.0.0.1:8765",
+  "team_board_root": "C:\\Tools\\codex-team-board"
+}
+```
+
+插件也会自动发现 `%USERPROFILE%\plugins\codex-team-board`、
+`%USERPROFILE%\CodexTools\codex-team-board`、同级克隆目录和
+`%LOCALAPPDATA%\CodexTeamBoard`。推荐让团队面板安装器通过
+`-ContextMeterRoot` 一次完成联动。
 
 交接生成后会在项目根更新 `HANDOFF.md`，并镜像完整链到
 `.codex/handoffs/codex-context-meter/`。没有项目目录时回退到

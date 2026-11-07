@@ -1,6 +1,9 @@
 param(
     [string]$Destination,
-    [switch]$NoStart
+    [switch]$NoStart,
+    [string]$TeamBoardRoot,
+    [string]$DashboardUrl = 'http://127.0.0.1:8765',
+    [switch]$NoTeamBoardIntegration
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,6 +19,55 @@ $python = Get-Command python.exe -ErrorAction Stop
 $powerShell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $vbs = Join-Path $Destination 'scripts\launch-hidden.vbs'
+
+function Test-TeamBoardRoot([string]$Path) {
+    return (
+        $Path -and
+        (Test-Path -LiteralPath (Join-Path $Path 'src\teamctl.py') -PathType Leaf)
+    )
+}
+
+function Resolve-TeamBoardRoot {
+    $candidates = @(
+        $TeamBoardRoot,
+        $env:CODEX_TEAM_BOARD_ROOT,
+        $env:CODEX_TEAM_ROOT,
+        (Join-Path $env:USERPROFILE 'plugins\codex-team-board'),
+        (Join-Path $env:USERPROFILE 'CodexTools\codex-team-board'),
+        (Join-Path (Split-Path $source -Parent) 'codex-team-board'),
+        (Join-Path (Split-Path (Split-Path $source -Parent) -Parent) 'codex-team-board'),
+        (Join-Path $env:LOCALAPPDATA 'CodexTeamBoard')
+    )
+    foreach ($candidate in $candidates) {
+        if (!$candidate) { continue }
+        $resolved = [IO.Path]::GetFullPath($candidate)
+        if (Test-TeamBoardRoot $resolved) {
+            return $resolved
+        }
+    }
+    return $null
+}
+
+function Write-TeamBoardConfig([string]$Root, [string]$Url) {
+    $configPath = Join-Path $dataDir 'config.json'
+    $config = @{}
+    if (Test-Path -LiteralPath $configPath) {
+        try {
+            $existing = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 |
+                ConvertFrom-Json
+            foreach ($property in $existing.PSObject.Properties) {
+                $config[$property.Name] = $property.Value
+            }
+        }
+        catch {}
+    }
+    $config['team_dashboard_url'] = $Url
+    $config['team_board_root'] = $Root
+    New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+    $config |
+        ConvertTo-Json -Depth 20 |
+        Set-Content -LiteralPath $configPath -Encoding utf8
+}
 
 function Set-ManagedAgentInstructions([string]$Path, [string]$Block) {
     $parent = [IO.Path]::GetDirectoryName($Path)
@@ -56,6 +108,39 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 & (Join-Path $PSScriptRoot 'sync-runtime.ps1') | Out-Null
+
+$resolvedTeamBoardRoot = $null
+if (!$NoTeamBoardIntegration) {
+    try {
+        $dashboardUri = [Uri]$DashboardUrl
+    }
+    catch {
+        throw "Invalid DashboardUrl: $DashboardUrl"
+    }
+    if ($dashboardUri.Scheme -ne 'http') {
+        throw 'DashboardUrl must use http.'
+    }
+    $resolvedTeamBoardRoot = Resolve-TeamBoardRoot
+    if (!$resolvedTeamBoardRoot) {
+        throw (
+            'Codex team board was not found. Install RSmfOffice/codex-team-board first, ' +
+            'pass -TeamBoardRoot <path>, or use -NoTeamBoardIntegration.'
+        )
+    }
+    [Environment]::SetEnvironmentVariable(
+        'CODEX_TEAM_BOARD_ROOT',
+        $resolvedTeamBoardRoot,
+        'User'
+    )
+    [Environment]::SetEnvironmentVariable(
+        'CODEX_TEAM_DASHBOARD_URL',
+        $DashboardUrl,
+        'User'
+    )
+    $env:CODEX_TEAM_BOARD_ROOT = $resolvedTeamBoardRoot
+    $env:CODEX_TEAM_DASHBOARD_URL = $DashboardUrl
+    Write-TeamBoardConfig -Root $resolvedTeamBoardRoot -Url $DashboardUrl
+}
 
 if (Test-Path -LiteralPath $Destination) {
     $backup = Join-Path $dataDir ('plugin-backup-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))
@@ -124,4 +209,7 @@ finally {
     pluginRoot = $Destination
     taskName = $taskName
     dataDir = $dataDir
+    teamBoardRoot = $resolvedTeamBoardRoot
+    dashboardUrl = $(if ($resolvedTeamBoardRoot) { $DashboardUrl } else { $null })
+    teamBoardIntegration = [bool]$resolvedTeamBoardRoot
 } | ConvertTo-Json

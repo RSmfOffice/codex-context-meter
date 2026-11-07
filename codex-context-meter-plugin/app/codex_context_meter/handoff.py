@@ -338,6 +338,17 @@ def create_handoff(
         ("本会话已知失败请求体", _payload_mb(metrics.get("minFailedRequestBytes"))),
         ("图片", f"{int(metrics.get('imageCount') or 0)} 张 / {_payload_mb(metrics.get('imagePayloadBytes'))}"),
         ("载荷风险", _text(metrics.get("payloadRisk"), "unknown")),
+        ("预警", _text(metrics.get("warningText"), "无")),
+        ("上下文压缩次数", str(int(metrics.get("compactionCount") or 0))),
+        (
+            "最近压缩",
+            (
+                f"{int(metrics.get('lastCompactionBeforeTokens') or 0):,} → "
+                f"{int(metrics.get('lastCompactionAfterTokens') or 0):,} token"
+                if int(metrics.get("compactionCount") or 0)
+                else "无"
+            ),
+        ),
         ("最近 413", "是" if metrics.get("requestTooLarge") else "否"),
     ]
     body = [

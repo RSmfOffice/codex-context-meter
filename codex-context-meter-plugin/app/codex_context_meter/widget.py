@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 from .active_thread import ActiveThreadMonitor
 from .handoff import create_handoff
 from .session_stats import SessionSnapshot, SessionStatsTracker
+from .team_dashboard import DEFAULT_DASHBOARD_URL, discover_team_root, ensure_dashboard
 
 
 APP_NAME = "Codex Context Meter"
@@ -213,6 +215,8 @@ def load_config() -> dict:
         "alpha": 0.94,
         "payload_warning_bytes": PAYLOAD_WARNING_BYTES,
         "payload_critical_bytes": PAYLOAD_CRITICAL_BYTES,
+        "team_dashboard_url": DEFAULT_DASHBOARD_URL,
+        "team_board_root": str(discover_team_root() or ""),
     }
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -271,6 +275,27 @@ def write_state(
             payload_warning_bytes,
             payload_critical_bytes,
         ),
+        "warningRisk": warning_state(
+            snapshot,
+            payload_warning_bytes,
+            payload_critical_bytes,
+        )[0],
+        "warningText": warning_state(
+            snapshot,
+            payload_warning_bytes,
+            payload_critical_bytes,
+        )[1],
+        "compactionCount": snapshot.compaction_count if snapshot else 0,
+        "lastCompactionBeforeTokens": (
+            snapshot.last_compaction_before_tokens if snapshot else 0
+        ),
+        "lastCompactionAfterTokens": (
+            snapshot.last_compaction_after_tokens if snapshot else 0
+        ),
+        "observedCompactRatio": (
+            snapshot.observed_compact_ratio if snapshot else None
+        ),
+        "lastCompactionAt": snapshot.last_compaction_at if snapshot else None,
         "nativeFollow": follow_state,
         "updatedAt": time.time(),
     }
@@ -303,19 +328,13 @@ def payload_risk(
         )
         if current >= snapshot.min_failure_payload_bytes - margin:
             return "critical"
-        if current >= snapshot.min_failure_payload_bytes * 0.9:
+        if current >= snapshot.min_failure_payload_bytes * 0.8:
             return "warning"
         return "normal"
     if snapshot.max_success_payload_bytes > 0:
-        if current >= max(
-            critical_bytes,
-            snapshot.max_success_payload_bytes * 1.15,
-        ):
+        if current >= snapshot.max_success_payload_bytes * 1.15:
             return "critical"
-        if current >= max(
-            warning_bytes,
-            snapshot.max_success_payload_bytes * 1.02,
-        ):
+        if current >= snapshot.max_success_payload_bytes * 0.9:
             return "warning"
         return "normal"
     if current >= critical_bytes:
@@ -323,6 +342,96 @@ def payload_risk(
     if current >= warning_bytes:
         return "warning"
     return "normal"
+
+
+def context_risk(snapshot: SessionSnapshot | None) -> tuple[str, str]:
+    if snapshot is None or snapshot.context_window <= 0:
+        return "normal", ""
+    ratio = snapshot.percent / 100.0
+    observed = snapshot.observed_compact_ratio
+    trigger = observed if observed and 0.5 <= observed <= 1.0 else 0.90
+    if ratio >= max(0.70, trigger - 0.015):
+        return "critical", "即将压缩"
+    if ratio >= max(0.65, trigger - 0.04):
+        return "warning", "接近压缩"
+    if (
+        snapshot.compaction_count >= 2
+        and snapshot.previous_compaction_after_tokens > 0
+        and snapshot.last_compaction_after_tokens
+        > snapshot.previous_compaction_after_tokens * 1.25
+        and ratio >= 0.55
+    ):
+        return "warning", "压缩后基线升高"
+    return "normal", ""
+
+
+def warning_state(
+    snapshot: SessionSnapshot | None,
+    payload_warning_bytes: int = PAYLOAD_WARNING_BYTES,
+    payload_critical_bytes: int = PAYLOAD_CRITICAL_BYTES,
+) -> tuple[str, str]:
+    if snapshot is None:
+        return "normal", ""
+    request_risk = payload_risk(snapshot, payload_warning_bytes, payload_critical_bytes)
+    token_risk, token_text = context_risk(snapshot)
+    if snapshot.request_too_large:
+        return "critical", f"413 已超限 · {compact_payload_bytes(snapshot.request_payload_bytes)}"
+    if request_risk == "critical":
+        if snapshot.min_failure_payload_bytes:
+            return (
+                "critical",
+                f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)}"
+                f"/{compact_payload_bytes(snapshot.min_failure_payload_bytes)} · 高风险",
+            )
+        if snapshot.max_success_payload_bytes:
+            return (
+                "critical",
+                f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)} · 高于已验证值",
+            )
+        return (
+            "critical",
+            f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)} · 超保守预算",
+        )
+    if token_risk == "critical":
+        return token_risk, token_text
+    if request_risk == "warning":
+        if snapshot.min_failure_payload_bytes:
+            return (
+                "warning",
+                f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)}"
+                f"/{compact_payload_bytes(snapshot.min_failure_payload_bytes)} · 提前预警",
+            )
+        if snapshot.max_success_payload_bytes:
+            return (
+                "warning",
+                f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)} · 接近已验证值",
+            )
+        return (
+            "warning",
+            f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)} · 接近保守预算",
+        )
+    if token_risk == "warning":
+        return token_risk, token_text
+    if snapshot.last_compaction_at and time.time() - snapshot.last_compaction_at <= 30:
+        after = (
+            compact_tokens(snapshot.last_compaction_after_tokens)
+            if snapshot.last_compaction_after_tokens
+            else "校准中"
+        )
+        return (
+            "info",
+            f"已压缩 {compact_tokens(snapshot.last_compaction_before_tokens)}"
+            f"→{after} · 第{snapshot.compaction_count}次",
+        )
+    if snapshot.image_payload_bytes >= 8_000_000:
+        return (
+            "warning",
+            f"图片 {snapshot.image_count} 张 · "
+            f"{compact_payload_bytes(snapshot.image_payload_bytes)}",
+        )
+    if snapshot.stale:
+        return "warning", "等待下一次 usage 校准"
+    return "normal", ""
 
 
 def process_name(pid: int) -> str:
@@ -624,6 +733,16 @@ def snapshot_signature(snapshot: SessionSnapshot | None) -> tuple | None:
         snapshot.min_failure_payload_bytes,
         snapshot.request_too_large,
         snapshot.request_error,
+        snapshot.compaction_count,
+        snapshot.last_compaction_before_tokens,
+        snapshot.last_compaction_after_tokens,
+        snapshot.previous_compaction_after_tokens,
+        snapshot.observed_compact_ratio,
+        snapshot.last_compaction_at,
+        bool(
+            snapshot.last_compaction_at
+            and time.time() - snapshot.last_compaction_at <= 30
+        ),
     )
 
 
@@ -674,7 +793,7 @@ def render_meter_image(
 
     percent = snapshot.percent if snapshot else 0.0
     color = ring_color(percent) if snapshot else MUTED
-    request_risk = payload_risk(
+    warning_severity, warning_text = warning_state(
         snapshot,
         payload_warning_bytes,
         payload_critical_bytes,
@@ -707,9 +826,11 @@ def render_meter_image(
         (right_x, 11 * SCALE, right_x + 5 * SCALE, 16 * SCALE),
         fill=(
             RED
-            if request_risk == "critical"
+            if warning_severity == "critical"
             else AMBER
-            if request_risk == "warning"
+            if warning_severity == "warning"
+            else CYAN
+            if warning_severity == "info"
             else color
         ),
     )
@@ -729,43 +850,20 @@ def render_meter_image(
         draw.text((right_x, 48 * SCALE), remaining, fill=MUTED, font=FONT_META)
         draw.text((right_x + 67 * SCALE, 48 * SCALE), "·", fill=TRACK, font=FONT_META)
         draw.text((right_x + 77 * SCALE, 48 * SCALE), f"缓存 {rate}", fill=GREEN, font=FONT_META)
-        if snapshot.request_too_large:
-            warning = f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)} · 413 超限"
-            draw.text((right_x, 63 * SCALE), warning, fill=RED, font=FONT_META)
-        elif request_risk == "critical":
-            warning = (
-                f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)}"
-                " · 接近失败线"
-                if snapshot.min_failure_payload_bytes
-                else f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)}"
-                " · 超保守预算"
+        if warning_text:
+            warning_color = (
+                RED
+                if warning_severity == "critical"
+                else AMBER
+                if warning_severity == "warning"
+                else CYAN
             )
-            draw.text((right_x, 63 * SCALE), warning, fill=RED, font=FONT_META)
-        elif request_risk == "warning":
-            if snapshot.min_failure_payload_bytes:
-                warning = (
-                    f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)}"
-                    " · 本会话高风险"
-                )
-            elif snapshot.max_success_payload_bytes:
-                warning = (
-                    f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)}"
-                    " · 超已验证值"
-                )
-            else:
-                warning = (
-                    f"请求体 {compact_payload_bytes(snapshot.request_payload_bytes)}"
-                    " · 接近保守预算"
-                )
-            draw.text((right_x, 63 * SCALE), warning, fill=AMBER, font=FONT_META)
-        elif snapshot.image_payload_bytes >= 8_000_000:
-            warning = (
-                f"图片 {snapshot.image_count} 张 · "
-                f"{compact_payload_bytes(snapshot.image_payload_bytes)}"
+            draw.text(
+                (right_x, 63 * SCALE),
+                trim_text(draw, warning_text, max_title_width, FONT_META),
+                fill=warning_color,
+                font=FONT_META,
             )
-            draw.text((right_x, 63 * SCALE), warning, fill=AMBER, font=FONT_META)
-        elif snapshot.stale:
-            draw.text((right_x, 63 * SCALE), "等待下一次 usage 校准", fill=AMBER, font=FONT_META)
     else:
         draw.text((right_x, 28 * SCALE), "暂无会话用量", fill=MUTED, font=FONT_VALUE)
         draw.text((right_x, 50 * SCALE), "发送一条消息后显示", fill=MUTED, font=FONT_META)
@@ -824,6 +922,9 @@ class ContextMeterWidget:
         self.dragging = False
         self.drag_after_id: str | None = None
         self.last_host_probe = 0.0
+        self.dashboard_events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.dashboard_opening = False
+        self.dashboard_lock = threading.Lock()
         self.click_monitor_stop = threading.Event()
         self.canvas.bind("<ButtonPress-1>", self._begin_drag)
         self.canvas.bind("<B1-Motion>", self._drag)
@@ -1096,8 +1197,35 @@ class ContextMeterWidget:
                     ),
                     state="disabled",
                 )
+            if self.snapshot.compaction_count:
+                after = (
+                    compact_tokens(self.snapshot.last_compaction_after_tokens)
+                    if self.snapshot.last_compaction_after_tokens
+                    else "校准中"
+                )
+                menu.add_command(
+                    label=(
+                        f"已压缩 {self.snapshot.compaction_count} 次 · "
+                        f"上次 {compact_tokens(self.snapshot.last_compaction_before_tokens)}"
+                        f"→{after}"
+                    ),
+                    state="disabled",
+                )
+            severity, warning_text = warning_state(
+                self.snapshot,
+                int(self.config.get("payload_warning_bytes", PAYLOAD_WARNING_BYTES)),
+                int(self.config.get("payload_critical_bytes", PAYLOAD_CRITICAL_BYTES)),
+            )
+            if warning_text:
+                menu.add_command(label=f"预警：{warning_text}", state="disabled")
             menu.add_command(label="生成交接报告…", command=self._write_handoff)
             menu.add_separator()
+        menu.add_command(
+            label="打开 Codex 团队看板",
+            command=self._open_team_dashboard,
+            state="disabled" if self.dashboard_opening else "normal",
+        )
+        menu.add_separator()
         menu.add_command(label="自动跟随当前选中会话", command=self._reset_auto)
         sessions = tk.Menu(menu, tearoff=False)
         current = self.snapshot.thread_id if self.snapshot else None
@@ -1111,6 +1239,50 @@ class ContextMeterWidget:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _open_team_dashboard(self) -> None:
+        with self.dashboard_lock:
+            if self.dashboard_opening:
+                return
+            self.dashboard_opening = True
+
+        def worker() -> None:
+            try:
+                result = ensure_dashboard(
+                    self.config,
+                    log_dir=APP_DIR,
+                    open_browser=True,
+                    log_callback=log,
+                )
+                self.dashboard_events.put(
+                    (
+                        "ok",
+                        f"team dashboard opened url={result['url']} started={result['started']}",
+                    )
+                )
+            except Exception as error:
+                log(f"team dashboard open failed: {error}\n{traceback.format_exc()}")
+                self.dashboard_events.put(("error", str(error)))
+            finally:
+                with self.dashboard_lock:
+                    self.dashboard_opening = False
+
+        threading.Thread(
+            target=worker,
+            name="codex-team-dashboard",
+            daemon=True,
+        ).start()
+
+    def _drain_dashboard_events(self) -> None:
+        while True:
+            try:
+                kind, message = self.dashboard_events.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "error":
+                messagebox.showerror("Codex 团队看板", message, parent=self.root)
+            else:
+                log(message)
 
     def _quit(self) -> None:
         self.click_monitor_stop.set()
@@ -1165,6 +1337,18 @@ class ContextMeterWidget:
             "imagePayloadBytes": snapshot.image_payload_bytes if snapshot else 0,
             "payloadRisk": payload_risk(snapshot, warning_bytes, critical_bytes),
             "requestTooLarge": snapshot.request_too_large if snapshot else False,
+            "warningRisk": warning_state(snapshot, warning_bytes, critical_bytes)[0],
+            "warningText": warning_state(snapshot, warning_bytes, critical_bytes)[1],
+            "compactionCount": snapshot.compaction_count if snapshot else 0,
+            "lastCompactionBeforeTokens": (
+                snapshot.last_compaction_before_tokens if snapshot else 0
+            ),
+            "lastCompactionAfterTokens": (
+                snapshot.last_compaction_after_tokens if snapshot else 0
+            ),
+            "observedCompactRatio": (
+                snapshot.observed_compact_ratio if snapshot else None
+            ),
         }
         reason = (
             "request-413"
@@ -1331,6 +1515,7 @@ class ContextMeterWidget:
 
     def _update(self) -> None:
         try:
+            self._drain_dashboard_events()
             self.tick += 1
             if self.dragging:
                 self.root.after(UI_UPDATE_MS, self._update)

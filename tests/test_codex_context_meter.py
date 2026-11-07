@@ -20,7 +20,9 @@ from codex_context_meter.widget import (
     PAYLOAD_WARNING_BYTES,
     WIDTH,
     clamp_overlay_position,
+    context_risk,
     payload_risk,
+    warning_state,
 )
 from codex_context_meter.window_follower import translated_position
 
@@ -29,6 +31,72 @@ THREAD_ID = "01a187b3-00ff-7270-909e-c60b1d3e814f"
 
 
 class SessionStatsTrackerTests(unittest.TestCase):
+    def test_detects_compaction_and_predicts_next_pressure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            session_dir = home / "sessions" / "2026" / "11" / "07"
+            session_dir.mkdir(parents=True)
+            session_path = session_dir / f"rollout-2026-11-07T10-00-00-{THREAD_ID}.jsonl"
+            rows = [
+                {"type": "turn_context", "payload": {"model": "deepseek-flash"}},
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-11-07T10:00:01Z",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {"input_tokens": 8000},
+                            "last_token_usage": {"input_tokens": 8000},
+                            "model_context_window": 10_000,
+                        },
+                    },
+                },
+                {
+                    "type": "compacted",
+                    "timestamp": "2026-11-07T10:00:02Z",
+                    "payload": {"window_number": 2},
+                },
+                {
+                    "type": "event_msg",
+                    "timestamp": "2026-11-07T10:00:03Z",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {"input_tokens": 9000},
+                            "last_token_usage": {"input_tokens": 1000},
+                            "model_context_window": 10_000,
+                        },
+                    },
+                },
+            ]
+            session_path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            tracker = SessionStatsTracker(codex_home=home)
+            snapshot = tracker.snapshot(THREAD_ID)
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+            self.assertEqual(snapshot.compaction_count, 1)
+            self.assertEqual(snapshot.last_compaction_before_tokens, 8000)
+            self.assertEqual(snapshot.last_compaction_after_tokens, 1000)
+            self.assertAlmostEqual(snapshot.observed_compact_ratio, 0.8)
+
+            warning = replace(snapshot, percent=78.0)
+            self.assertEqual(context_risk(warning), ("warning", "接近压缩"))
+            critical = replace(snapshot, percent=79.0)
+            self.assertEqual(context_risk(critical), ("critical", "即将压缩"))
+            self.assertEqual(warning_state(critical), ("critical", "即将压缩"))
+
+            near_413 = replace(
+                snapshot,
+                request_payload_bytes=44 * 1024 * 1024,
+                min_failure_payload_bytes=55 * 1024 * 1024,
+            )
+            severity, message = warning_state(near_413)
+            self.assertEqual(severity, "warning")
+            self.assertIn("提前预警", message)
+
     def test_projects_context_from_anchor_and_reports_cache_rate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)

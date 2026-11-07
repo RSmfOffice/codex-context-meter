@@ -158,6 +158,12 @@ class SessionSnapshot:
     request_too_large: bool = False
     request_error: str = ""
     workspace_path: str = ""
+    compaction_count: int = 0
+    last_compaction_before_tokens: int = 0
+    last_compaction_after_tokens: int = 0
+    previous_compaction_after_tokens: int = 0
+    observed_compact_ratio: float | None = None
+    last_compaction_at: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -182,6 +188,15 @@ class _PayloadState:
     min_failure_payload_bytes: int = 0
     request_too_large: bool = False
     request_error: str = ""
+    last_token_input: int = 0
+    context_window: int = 0
+    compaction_count: int = 0
+    last_compaction_before_tokens: int = 0
+    last_compaction_after_tokens: int = 0
+    previous_compaction_after_tokens: int = 0
+    observed_compact_ratio: float | None = None
+    last_compaction_at: float | None = None
+    waiting_for_post_compaction: bool = False
 
 
 class SessionStatsTracker:
@@ -407,6 +422,12 @@ class SessionStatsTracker:
                 request_too_large=payload.request_too_large,
                 request_error=payload.request_error,
                 workspace_path=self._session_workspace(path),
+                compaction_count=payload.compaction_count,
+                last_compaction_before_tokens=payload.last_compaction_before_tokens,
+                last_compaction_after_tokens=payload.last_compaction_after_tokens,
+                previous_compaction_after_tokens=payload.previous_compaction_after_tokens,
+                observed_compact_ratio=payload.observed_compact_ratio,
+                last_compaction_at=payload.last_compaction_at,
             )
         self._cache[str(path)] = _FileResult(snapshot, stat.st_mtime_ns, stat.st_size)
         return snapshot
@@ -499,6 +520,8 @@ class SessionStatsTracker:
             b'"response_item"' not in raw
             and b'"token_usage_record"' not in raw
             and b'"task_complete"' not in raw
+            and b'"token_count"' not in raw
+            and b'"compacted"' not in raw
         ):
             return
         try:
@@ -509,6 +532,9 @@ class SessionStatsTracker:
             return
         kind = item.get("type")
         payload = item.get("payload")
+        if kind == "compacted":
+            cls._record_compaction(state, item.get("timestamp"))
+            return
         if kind == "response_item":
             state.request_payload_bytes += len(raw) + 1
             cls._consume_payload_value(payload, state)
@@ -521,7 +547,25 @@ class SessionStatsTracker:
             return
         if kind != "event_msg" or not isinstance(payload, dict):
             return
-        if payload.get("type") != "task_complete":
+        event_type = str(payload.get("type") or "")
+        if event_type == "token_count":
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                return
+            last_usage = info.get("last_token_usage")
+            if isinstance(last_usage, dict):
+                input_tokens = _int(last_usage.get("input_tokens"))
+                if input_tokens > 0:
+                    state.last_token_input = input_tokens
+                    if state.waiting_for_post_compaction:
+                        state.last_compaction_after_tokens = input_tokens
+                        state.waiting_for_post_compaction = False
+            state.context_window = _int(info.get("model_context_window"))
+            return
+        if "compact" in event_type.casefold():
+            cls._record_compaction(state, item.get("timestamp"))
+            return
+        if event_type != "task_complete":
             return
         error = payload.get("error")
         if not error:
@@ -549,6 +593,25 @@ class SessionStatsTracker:
                     state.request_payload_bytes,
                 )
             )
+
+    @classmethod
+    def _record_compaction(cls, state: _PayloadState, timestamp: Any) -> None:
+        state.compaction_count += 1
+        state.previous_compaction_after_tokens = state.last_compaction_after_tokens
+        state.last_compaction_before_tokens = state.last_token_input
+        state.last_compaction_after_tokens = 0
+        state.waiting_for_post_compaction = True
+        state.last_compaction_at = _parse_timestamp(timestamp)
+        if state.context_window > 0 and state.last_token_input > 0:
+            state.observed_compact_ratio = min(
+                1.0,
+                state.last_token_input / state.context_window,
+            )
+        # A compaction replaces the old prompt history. Start a fresh estimate
+        # for the next serialized request instead of keeping all prior items.
+        state.request_payload_bytes = 0
+        state.image_count = 0
+        state.image_payload_bytes = 0
 
     def _inspect(self, path: Path, thread_id: str, modified: float) -> SessionSnapshot | None:
         lines: list[str] = []
@@ -679,6 +742,9 @@ class SessionStatsTracker:
                     event_type = str(payload.get("type") or "").lower()
                     if "compact" in event_type:
                         stale = True
+                continue
+            if item.get("type") == "compacted":
+                stale = True
                 continue
             if item.get("type") != "response_item":
                 continue

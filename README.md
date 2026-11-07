@@ -18,6 +18,8 @@
 - 支持拖动、位置记忆、自动跟随和右键手动锁定会话。
 - Codex 最小化或退出时隐藏，恢复后重新出现。
 - 支持登录后自动启动、后台守护和 MCP 状态/启停工具。
+- 右键可直接打开 Codex 团队任务看板，并在需要时自动拉起本地看板服务。
+- 基于本会话 compaction 比例和 413 失败边界显示简洁的提前预警。
 
 ## 系统要求
 
@@ -43,7 +45,8 @@ pythonw.exe .\codex_context_meter.pyw
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File .\codex-context-meter-plugin\scripts\install.ps1
+  -File .\codex-context-meter-plugin\scripts\install.ps1 `
+  -TeamBoardRoot ..\codex-team-board
 ```
 
 安装器会：
@@ -52,8 +55,26 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 2. 安装个人插件到 `%USERPROFILE%\plugins\codex-context-meter`。
 3. 注册登录计划任务 `Codex Context Meter`。
 4. 配置自动启动和 supervisor 健康恢复。
+5. 写入团队看板根目录和 URL，供右键菜单自动启动看板。
 
 首次安装后重启一次 Codex，使插件和 MCP 工具进入当前进程。
+
+若尚未安装团队看板，可先克隆并安装
+[`RSmfOffice/codex-team-board`](https://github.com/RSmfOffice/codex-team-board)，
+或独立安装插件：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\codex-context-meter-plugin\scripts\install.ps1 `
+  -NoTeamBoardIntegration
+```
+
+也可以通过仓库 marketplace 安装：
+
+```powershell
+codex plugin marketplace add RSmfOffice/codex-context-meter --ref v0.1.5
+codex plugin add codex-context-meter@codex-tools
+```
 
 ## 使用
 
@@ -61,9 +82,42 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 | --- | --- |
 | 左键拖动 | 在 Codex 客户区内移动并记忆位置 |
 | 左键单击 | 解除手动锁定并恢复自动跟随当前会话 |
-| 右键单击 | 查看精确数值、选择会话、恢复自动跟随或退出 |
+| 右键单击 | 查看精确数值、打开团队看板、选择会话、恢复自动跟随或退出 |
 
 更完整的指标口径、刷新机制和限制见 [CODEX_CONTEXT_METER.md](CODEX_CONTEXT_METER.md)。
+
+## 团队看板联动
+
+看板默认地址为 `http://127.0.0.1:8765`。插件会依次从配置、用户环境变量、
+`%USERPROFILE%\plugins\codex-team-board`、`%USERPROFILE%\CodexTools`、同级克隆
+目录和 `%LOCALAPPDATA%\CodexTeamBoard` 自动发现面板源码。
+
+推荐由面板安装器统一配置：
+
+```powershell
+Set-Location ..\codex-team-board
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\install.ps1 `
+  -ContextMeterRoot ..\codex-context-meter
+```
+
+也可手工设置：
+
+```powershell
+[Environment]::SetEnvironmentVariable(
+  "CODEX_TEAM_BOARD_ROOT",
+  "C:\Tools\codex-team-board",
+  "User"
+)
+[Environment]::SetEnvironmentVariable(
+  "CODEX_TEAM_DASHBOARD_URL",
+  "http://127.0.0.1:8765",
+  "User"
+)
+```
+
+右键“打开 Codex 团队看板”会先检查 `/api/health`；未运行时通过发现的
+`src/teamctl.py` 启动看板，再打开默认浏览器。
 
 ## 计量方式
 
