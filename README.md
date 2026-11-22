@@ -18,7 +18,9 @@
 - 支持拖动、位置记忆、自动跟随和右键手动锁定会话。
 - Codex 最小化或退出时隐藏，恢复后重新出现。
 - 支持登录后自动启动、后台守护和 MCP 状态/启停工具。
+- 关机或注销时主动停止 PowerShell 子进程，避免 `0xc0000142` 弹窗阻塞关机。
 - 右键可直接打开 Codex 团队任务看板，并在需要时自动拉起本地看板服务。
+- 团队看板按 `Team Home` 校验数据库身份，拒绝连接错误数据库。
 - 基于本会话 compaction 比例和 413 失败边界显示简洁的提前预警。
 
 ## 系统要求
@@ -72,7 +74,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 也可以通过仓库 marketplace 安装：
 
 ```powershell
-codex plugin marketplace add RSmfOffice/codex-context-meter --ref v0.1.5
+codex plugin marketplace add RSmfOffice/codex-context-meter --ref v0.1.6
 codex plugin add codex-context-meter@codex-tools
 ```
 
@@ -117,7 +119,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 ```
 
 右键“打开 Codex 团队看板”会先检查 `/api/health`；未运行时通过发现的
-`src/teamctl.py` 启动看板，再打开默认浏览器。
+`src/teamctl.py` 启动看板，再打开默认浏览器。插件会从配置、
+`CODEX_TEAM_HOME`、Codex `config.toml` 的 `codexTeamBoard.env.CODEX_TEAM_HOME`
+和默认目录解析 `Team Home`，并校验 `/api/health` 返回的数据库路径，避免把其他
+Team Home 的旧看板误认为当前项目。
 
 ## 计量方式
 

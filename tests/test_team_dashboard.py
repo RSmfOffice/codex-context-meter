@@ -84,10 +84,19 @@ class TeamDashboardTests(unittest.TestCase):
 
     def test_existing_dashboard_opens_without_starting_process(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
+            team_home = Path(temporary) / "team-home"
             with (
                 patch(
-                    "codex_context_meter.team_dashboard.is_dashboard_available",
-                    return_value=True,
+                    "codex_context_meter.team_dashboard.discover_team_home",
+                    return_value=team_home,
+                ),
+                patch(
+                    "codex_context_meter.team_dashboard.dashboard_health",
+                    return_value={
+                        "ok": True,
+                        "service": "codex-team-board",
+                        "database": str(team_home / "team.sqlite"),
+                    },
                 ),
                 patch(
                     "codex_context_meter.team_dashboard.webbrowser.open",
@@ -101,6 +110,29 @@ class TeamDashboardTests(unittest.TestCase):
         self.assertFalse(result["started"])
         self.assertTrue(result["opened"])
         browser_open.assert_called_once()
+
+    def test_existing_dashboard_rejects_database_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            team_home = Path(temporary) / "team-home"
+            with (
+                patch(
+                    "codex_context_meter.team_dashboard.discover_team_home",
+                    return_value=team_home,
+                ),
+                patch(
+                    "codex_context_meter.team_dashboard.dashboard_health",
+                    return_value={
+                        "ok": True,
+                        "service": "codex-team-board",
+                        "database": str(Path(temporary) / "wrong" / "team.sqlite"),
+                    },
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "数据库不匹配"):
+                    ensure_dashboard(
+                        {"team_dashboard_url": "http://127.0.0.1:8765"},
+                        log_dir=Path(temporary),
+                    )
 
 
 if __name__ == "__main__":

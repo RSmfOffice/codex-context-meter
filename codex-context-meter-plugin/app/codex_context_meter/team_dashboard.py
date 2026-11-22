@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+import tomllib
 import webbrowser
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -56,6 +57,62 @@ def discover_team_root(config: dict | None = None) -> Path | None:
 DEFAULT_TEAM_ROOT = discover_team_root()
 
 
+def _codex_home() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    return (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".codex"
+    )
+
+
+def _team_home_from_codex_config() -> Path | None:
+    config_path = _codex_home() / "config.toml"
+    try:
+        with config_path.open("rb") as stream:
+            config = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return None
+    team_board = servers.get("codexTeamBoard")
+    if not isinstance(team_board, dict):
+        return None
+    env = team_board.get("env")
+    if not isinstance(env, dict):
+        return None
+    value = env.get("CODEX_TEAM_HOME")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def discover_team_home(config: dict | None = None) -> Path:
+    config = config or {}
+    candidates: list[object] = [
+        config.get("team_home"),
+        os.environ.get("CODEX_TEAM_HOME"),
+        _team_home_from_codex_config(),
+    ]
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.append(Path(local_app_data) / "CodexTeam")
+    candidates.append(Path.home() / ".codex" / "team-board")
+    for value in candidates:
+        if not value:
+            continue
+        try:
+            candidate = Path(value).expanduser().resolve()
+        except (OSError, TypeError, ValueError):
+            continue
+        return candidate
+    raise RuntimeError("无法确定 Codex Team Board Home")
+
+
 def _endpoint(url: str) -> tuple[str, int]:
     parsed = urlsplit(url)
     if parsed.scheme != "http" or not parsed.hostname:
@@ -63,7 +120,7 @@ def _endpoint(url: str) -> tuple[str, int]:
     return parsed.hostname, parsed.port or 80
 
 
-def is_dashboard_available(url: str, timeout: float = 0.6) -> bool:
+def dashboard_health(url: str, timeout: float = 0.6) -> dict | None:
     try:
         host, port = _endpoint(url)
         connection = http.client.HTTPConnection(host, port, timeout=timeout)
@@ -71,16 +128,43 @@ def is_dashboard_available(url: str, timeout: float = 0.6) -> bool:
             connection.request("GET", "/api/health")
             response = connection.getresponse()
             if response.status != 200:
-                return False
+                return None
             payload = json.loads(response.read().decode("utf-8"))
-            return bool(
+            if not (
                 payload.get("ok")
                 and payload.get("service") == "codex-team-board"
-            )
+            ):
+                return None
+            return payload
         finally:
             connection.close()
     except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):
+        return None
+
+
+def _normalized_database(payload: dict) -> Path | None:
+    value = payload.get("database")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def is_dashboard_available(
+    url: str,
+    timeout: float = 0.6,
+    *,
+    expected_home: Path | None = None,
+) -> bool:
+    payload = dashboard_health(url, timeout=timeout)
+    if payload is None:
         return False
+    if expected_home is None:
+        return True
+    expected_database = (expected_home / "team.sqlite").resolve()
+    return _normalized_database(payload) == expected_database
 
 
 def ensure_dashboard(
@@ -95,9 +179,24 @@ def ensure_dashboard(
         or os.environ.get("CODEX_TEAM_DASHBOARD_URL")
         or DEFAULT_DASHBOARD_URL
     ).strip()
-    if is_dashboard_available(url):
+    team_home = discover_team_home(config)
+    expected_database = (team_home / "team.sqlite").resolve()
+    existing = dashboard_health(url)
+    if existing is not None:
+        actual_database = _normalized_database(existing)
+        if actual_database != expected_database:
+            raise RuntimeError(
+                "团队看板数据库不匹配："
+                f"expected={expected_database} actual={actual_database or 'unknown'}"
+            )
         opened = _open_url(url) if open_browser else False
-        return {"url": url, "started": False, "opened": opened}
+        return {
+            "url": url,
+            "started": False,
+            "opened": opened,
+            "team_home": str(team_home),
+            "database": str(actual_database),
+        }
 
     root = discover_team_root(config)
     if root is None:
@@ -134,6 +233,11 @@ def ensure_dashboard(
                 "--no-browser",
             ],
             cwd=str(root),
+            env={
+                **os.environ,
+                "CODEX_TEAM_HOME": str(team_home),
+                "PYTHONUTF8": "1",
+            },
             stdin=subprocess.DEVNULL,
             stdout=stream,
             stderr=subprocess.STDOUT,
@@ -145,7 +249,8 @@ def ensure_dashboard(
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"团队看板启动失败，详情见 {log_path}")
-        if is_dashboard_available(url):
+        if is_dashboard_available(url, expected_home=team_home):
+            health = dashboard_health(url) or {}
             if log_callback:
                 log_callback(f"team dashboard started pid={process.pid} url={url}")
             opened = _open_url(url) if open_browser else False
@@ -155,8 +260,13 @@ def ensure_dashboard(
                 "opened": opened,
                 "pid": process.pid,
                 "log_path": str(log_path),
+                "team_home": str(team_home),
+                "database": str(expected_database),
+                "database_id": health.get("database_id"),
+                "schema_version": health.get("schema_version"),
             }
         time.sleep(0.2)
+    process.terminate()
     raise TimeoutError(f"团队看板在 8 秒内未就绪，详情见 {log_path}")
 
 

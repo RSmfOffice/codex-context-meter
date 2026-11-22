@@ -14,6 +14,8 @@ if (!$created) {
     return
 }
 
+. (Join-Path $PSScriptRoot 'session_state.ps1')
+
 function Write-Log([string]$message) {
     try {
         "[{0}] {1}" -f [DateTime]::Now.ToString('s'), $message |
@@ -64,6 +66,10 @@ function Get-WidgetHealth {
 }
 
 function Start-Widget([int]$hostPid) {
+    if (Test-WindowsShuttingDown) {
+        return $false
+    }
+
     $pythonw = Get-Command pythonw.exe -ErrorAction Stop
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $pythonw.Source
@@ -74,6 +80,7 @@ function Start-Widget([int]$hostPid) {
     $start.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
     [void][Diagnostics.Process]::Start($start)
     Write-Log ('started widget for host ' + $hostPid)
+    return $true
 }
 
 function Stop-Widgets([bool]$RemovePause) {
@@ -91,6 +98,12 @@ try {
     $lastCleanup = [DateTime]::MinValue
     $startupGraceUntil = [DateTime]::UtcNow.AddMilliseconds(800)
     while ($true) {
+        if (Test-WindowsShuttingDown) {
+            Stop-Widgets -RemovePause $true
+            Write-Log 'session ending: stopped widgets and supervisor'
+            break
+        }
+
         $hostProcess = Get-CodexProcess
         $health = Get-WidgetHealth
         $pause = $null
@@ -125,7 +138,11 @@ try {
             Start-Sleep -Milliseconds 100
         }
         elseif (!$health.healthy -and ([DateTime]::UtcNow - $lastStartAttempt).TotalSeconds -ge 3) {
-            Start-Widget -hostPid $hostProcess.Id
+            if (!(Start-Widget -hostPid $hostProcess.Id)) {
+                Stop-Widgets -RemovePause $true
+                Write-Log 'session ending: skipped widget start'
+                break
+            }
             $lastStartAttempt = [DateTime]::UtcNow
             Start-Sleep -Milliseconds 150
         }

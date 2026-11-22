@@ -32,6 +32,7 @@ Codex，让 MCP 工具和插件界面进入当前进程。
 ## 生命周期
 
 - 计划任务在用户登录时并行启动悬浮组件和 supervisor，首屏不等待 PowerShell 初始化。
+- Windows 关机或会话注销时，supervisor 与 active-thread 会停止 PowerShell 子进程，并禁止关机阶段重新拉起组件。
 - Codex 关闭后 supervisor 停止对应悬浮组件，下次 Codex 启动时重新拉起。
 - 其它普通窗口获得焦点时，悬浮组件仍保持显示。
 - 只有 Codex 窗口关闭或最小化时隐藏。
@@ -53,11 +54,17 @@ Codex，让 MCP 工具和插件界面进入当前进程。
 ```json
 {
   "team_dashboard_url": "http://127.0.0.1:8765",
-  "team_board_root": "C:\\Tools\\codex-team-board"
+  "team_board_root": "C:\\Tools\\codex-team-board",
+  "team_home": "C:\\Users\\<user>\\AppData\\Local\\Packages\\OpenAI.Codex_<package>\\LocalCache\\Local\\CodexTeam"
 }
 ```
 
-插件也会自动发现 `%USERPROFILE%\plugins\codex-team-board`、
+`team_home` 可省略；插件依次使用配置、`CODEX_TEAM_HOME`、
+`%CODEX_HOME%\\config.toml` 的 `codexTeamBoard.env.CODEX_TEAM_HOME` 和
+默认 `%LOCALAPPDATA%\\CodexTeam`。打开已有看板前会校验数据库身份，
+不匹配时拒绝打开而不是静默显示旧数据。
+
+插件也会自动发现 `%USERPROFILE%\\plugins\\codex-team-board`、
 `%USERPROFILE%\CodexTools\codex-team-board`、同级克隆目录和
 `%LOCALAPPDATA%\CodexTeamBoard`。推荐让团队面板安装器通过
 `-ContextMeterRoot` 一次完成联动。

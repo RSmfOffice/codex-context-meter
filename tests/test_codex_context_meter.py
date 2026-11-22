@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from codex_context_meter.active_thread import ActiveThreadMonitor
 from codex_context_meter.handoff import create_handoff
 from codex_context_meter.session_stats import (
     ROLE_OVERHEAD,
@@ -28,6 +29,44 @@ from codex_context_meter.window_follower import translated_position
 
 
 THREAD_ID = "01a187b3-00ff-7270-909e-c60b1d3e814f"
+
+
+class ActiveThreadShutdownTests(unittest.TestCase):
+    def test_shutdown_blocks_powershell_spawn(self) -> None:
+        monitor = ActiveThreadMonitor()
+        try:
+            with (
+                patch(
+                    "codex_context_meter.active_thread._windows_session_is_ending",
+                    return_value=True,
+                ),
+                patch("codex_context_meter.active_thread.subprocess.Popen") as popen,
+            ):
+                monitor.start()
+                self.assertTrue(monitor._stop.is_set())
+                self.assertIsNone(monitor._watchdog)
+                self.assertFalse(monitor._spawn_locked())
+                popen.assert_not_called()
+        finally:
+            monitor.close()
+
+    def test_spawn_oserror_stops_retry_loop(self) -> None:
+        monitor = ActiveThreadMonitor()
+        try:
+            with (
+                patch(
+                    "codex_context_meter.active_thread._windows_session_is_ending",
+                    return_value=False,
+                ),
+                patch(
+                    "codex_context_meter.active_thread.subprocess.Popen",
+                    side_effect=OSError("0xc0000142"),
+                ),
+            ):
+                self.assertFalse(monitor._spawn_locked())
+            self.assertIn("0xc0000142", monitor.error)
+        finally:
+            monitor.close()
 
 
 class SessionStatsTrackerTests(unittest.TestCase):

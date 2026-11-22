@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '..\..\scripts\session_state.ps1')
 try {
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 } catch {}
@@ -46,6 +47,10 @@ function Write-State {
 
 $nextParentCheck = [DateTime]::MinValue
 while ($true) {
+    if (Test-WindowsShuttingDown) {
+        break
+    }
+
     if ($ParentPid -gt 0 -and [DateTime]::UtcNow -ge $nextParentCheck) {
         if ($null -eq (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) {
             break

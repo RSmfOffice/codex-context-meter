@@ -11,7 +11,11 @@ from pathlib import Path
 
 
 CREATE_NO_WINDOW = 0x08000000
+SM_SHUTTINGDOWN = 0x2000
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.GetSystemMetrics.restype = ctypes.c_int
 kernel32.CreateEventW.argtypes = [
     ctypes.c_void_p,
     wintypes.BOOL,
@@ -23,6 +27,13 @@ kernel32.SetEvent.argtypes = [wintypes.HANDLE]
 kernel32.SetEvent.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+def _windows_session_is_ending() -> bool:
+    try:
+        return user32.GetSystemMetrics(SM_SHUTTINGDOWN) != 0
+    except (AttributeError, OSError):
+        return False
 
 
 class ActiveThreadMonitor:
@@ -38,7 +49,6 @@ class ActiveThreadMonitor:
         self._thread: threading.Thread | None = None
         self._watchdog: threading.Thread | None = None
         self._last_update = 0.0
-        self._spawned_at = 0.0
         self._refresh_requested = threading.Event()
         self._refresh_event_name = f"Local\\CodexContextMeterThreadRefresh-{os.getpid()}"
         self._refresh_event: int | None = None
@@ -47,6 +57,9 @@ class ActiveThreadMonitor:
         if self._watchdog is not None and self._watchdog.is_alive():
             return
         self._stop.clear()
+        if _windows_session_is_ending():
+            self._stop.set()
+            return
         if not self._refresh_event:
             handle = kernel32.CreateEventW(
                 None,
@@ -57,7 +70,8 @@ class ActiveThreadMonitor:
             if handle:
                 self._refresh_event = int(handle)
         with self._lock:
-            self._spawn_locked()
+            if not self._spawn_locked():
+                return
         self._watchdog = threading.Thread(
             target=self._watchdog_loop,
             name="codex-active-thread-watchdog",
@@ -65,34 +79,44 @@ class ActiveThreadMonitor:
         )
         self._watchdog.start()
 
-    def _spawn_locked(self) -> None:
-        process = subprocess.Popen(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(self.script),
-                "-IntervalMs",
-                "1200",
-                "-RefreshEventName",
-                self._refresh_event_name,
-                "-ParentPid",
-                str(os.getpid()),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=CREATE_NO_WINDOW,
-        )
+    def _spawn_locked(self) -> bool:
+        if self._stop.is_set() or _windows_session_is_ending():
+            self._stop.set()
+            return False
+
+        try:
+            process = subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(self.script),
+                    "-IntervalMs",
+                    "1200",
+                    "-RefreshEventName",
+                    self._refresh_event_name,
+                    "-ParentPid",
+                    str(os.getpid()),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except OSError as exc:
+            self.error = f"spawn-failed: {exc}"
+            if _windows_session_is_ending():
+                self._stop.set()
+            return False
+
         self._process = process
         self._last_update = time.monotonic()
-        self._spawned_at = self._last_update
         self._thread = threading.Thread(
             target=self._read_loop,
             args=(process,),
@@ -100,6 +124,7 @@ class ActiveThreadMonitor:
             daemon=True,
         )
         self._thread.start()
+        return True
 
     def _read_loop(self, process: subprocess.Popen[str]) -> None:
         if process is None or process.stdout is None:
@@ -122,6 +147,16 @@ class ActiveThreadMonitor:
 
     def _watchdog_loop(self) -> None:
         while not self._stop.is_set():
+            if _windows_session_is_ending():
+                self._stop.set()
+                self._refresh_requested.set()
+                with self._lock:
+                    process = self._process
+                    self._process = None
+                if process is not None:
+                    self._terminate_process(process)
+                return
+
             self._refresh_requested.wait(1.5)
             if self._stop.is_set():
                 return
@@ -132,8 +167,7 @@ class ActiveThreadMonitor:
             if process is None:
                 return
             stale = time.monotonic() - self._last_update > 6.0
-            aged = time.monotonic() - self._spawned_at > 8.0
-            if process.poll() is None and not stale and not aged and not refresh:
+            if process.poll() is None and not stale and not refresh:
                 continue
             self._recycle_process(process)
 
@@ -142,11 +176,13 @@ class ActiveThreadMonitor:
             if self._process is process:
                 self._process = None
         self._terminate_process(process)
-        if self._stop.is_set():
+        if self._stop.is_set() or _windows_session_is_ending():
+            self._stop.set()
             return
         with self._lock:
             if not self._stop.is_set():
-                self._spawn_locked()
+                if not self._spawn_locked():
+                    return
 
     def force_refresh(self) -> None:
         if not self._stop.is_set():
